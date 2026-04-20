@@ -8,8 +8,13 @@ if (-not (Test-Path "dist\WindowsVulnScanner.exe")) {
     pyinstaller main.spec
 }
 
-$iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-if (-not (Test-Path $iscc)) {
+$isccCandidates = @(
+    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+    "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
+    "${env:LOCALAPPDATA}\Programs\Inno Setup 6\ISCC.exe"
+)
+$iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $iscc) {
     throw "Inno Setup no encontrado. Instala Inno Setup 6 y vuelve a intentar."
 }
 
@@ -19,4 +24,3 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "OK: release\\WindowsVulnScanner-Setup.exe" -ForegroundColor Green
-
