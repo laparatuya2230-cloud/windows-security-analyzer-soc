@@ -5,9 +5,8 @@ Interfaz SOC con: chart, historial, remediation, notificaciones, dark/light, esc
 import json
 import math
 import os
-import re
-import base64
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -23,7 +22,6 @@ from scanner import WindowsScanner
 APP_NAME    = "Windows Vuln Scanner"
 APP_VERSION = "v2.0 PRO"
 HISTORY_FILE = Path("scan_history.json")
-FIX_HISTORY_FILE = Path("fix_history.jsonl")
 
 # ─────────────────────────────────────────────
 # THEMES
@@ -70,11 +68,9 @@ SEV_COLORS = {
 # ─────────────────────────────────────────────
 class MetricCard(tk.Frame):
     def __init__(self, parent, label, value="—", color="#00d4ff",
-                 bg="#0f2340", border="#1a3a5c", width=160, **kw):
+                 bg="#0f2340", border="#1a3a5c", **kw):
         super().__init__(parent, bg=bg,
-                         highlightbackground=border, highlightthickness=1,
-                         width=width, height=90, **kw)
-        self.pack_propagate(False)
+                         highlightbackground=border, highlightthickness=1, **kw)
         self._bg = bg
 
         self._bar = tk.Frame(self, bg=color, height=2)
@@ -167,12 +163,10 @@ class FindingRow(tk.Frame):
             tk.Label(self, text=short, bg=t["BG_HOVER"], fg=t["ACCENT"],
                      font=("Consolas", 8), padx=6).pack(side="right", padx=(0, 10), pady=6)
 
-        if on_fix:
-            btn = tk.Button(self, text="Fix ▶", bg=t["BG_HOVER"], fg=t["GREEN"],
-                            font=("Consolas", 8, "bold"), bd=0, padx=6, pady=2,
-                            cursor="hand2",
-                            command=lambda f=finding: on_fix(f))
-            btn.pack(side="right", padx=4, pady=4)
+        # Fix button desactivado — reactivar cuando esté listo el módulo de remediación
+        # if on_fix and sev in ("critical", "high", "medium"):
+        #     btn = tk.Button(self, text="Fix ▶", ...)
+        #     btn.pack(side="right", padx=4, pady=4)
 
 
 # ─────────────────────────────────────────────
@@ -183,7 +177,7 @@ class WindowsSecurityAuditorUI:
         self.root = root
         self.root.title(f"  {APP_NAME}  {APP_VERSION}")
         self.root.geometry("1360x820")
-        self.root.minsize(1100, 680)
+        self.root.minsize(800, 560)
 
         self.logger   = setup_logger()
         self.scanner  = WindowsScanner(self.logger)
@@ -196,7 +190,6 @@ class WindowsSecurityAuditorUI:
         self.filter_sev    = tk.StringVar(value="ALL")
         self.theme_name    = tk.StringVar(value="dark")
         self.schedule_var  = tk.StringVar(value="Off")
-        self.remediation_mode = tk.BooleanVar(value=False)
         self._schedule_job = None
 
         self.t = THEMES["dark"]
@@ -265,7 +258,48 @@ class WindowsSecurityAuditorUI:
         self.sidebar = tk.Frame(parent, bg=self.t["BG_PANEL"], width=240)
         self.sidebar.grid(row=0, column=0, sticky="nsw")
         self.sidebar.pack_propagate(False)
-        s = self.sidebar
+
+        # ── LOGO fijo en la parte inferior (se empaqueta primero para reservar espacio) ──
+        logo_bottom = tk.Frame(self.sidebar, bg=self.t["BG_PANEL"])
+        logo_bottom.pack(side="bottom", fill="x")
+
+        tk.Label(logo_bottom, text="SOC Edition", bg=self.t["BG_PANEL"],
+                 fg=self.t["TEXT_SEC"], font=("Consolas", 8)).pack(pady=(0, 8))
+
+        logo_path = Path(__file__).with_name("logo.png")
+        if logo_path.exists():
+            try:
+                from PIL import Image, ImageTk
+                pil_img = Image.open(str(logo_path)).convert("RGBA")
+                pil_img.thumbnail((160, 160), Image.LANCZOS)
+                img = ImageTk.PhotoImage(pil_img)
+                lbl = tk.Label(logo_bottom, image=img, bg=self.t["BG_PANEL"])
+                lbl.image = img
+                lbl.pack(pady=(8, 2))
+            except Exception:
+                pass
+
+        tk.Frame(logo_bottom, bg=self.t["BORDER"], height=1).pack(fill="x", padx=18, pady=(8, 0))
+
+        # ── Canvas scrollable para los controles ──
+        sb_canvas = tk.Canvas(self.sidebar, bg=self.t["BG_PANEL"],
+                              highlightthickness=0, width=238)
+        sb_canvas.pack(side="top", fill="both", expand=True)
+
+        s = tk.Frame(sb_canvas, bg=self.t["BG_PANEL"])
+        sb_canvas.create_window((0, 0), window=s, anchor="nw", width=238)
+
+        def _on_configure(_):
+            sb_canvas.configure(scrollregion=sb_canvas.bbox("all"))
+        s.bind("<Configure>", _on_configure)
+
+        def _bind_wheel(_):
+            sb_canvas.bind_all("<MouseWheel>",
+                lambda ev: sb_canvas.yview_scroll(int(-1*(ev.delta/120)), "units"))
+        def _unbind_wheel(_):
+            sb_canvas.unbind_all("<MouseWheel>")
+        sb_canvas.bind("<Enter>", _bind_wheel)
+        sb_canvas.bind("<Leave>", _unbind_wheel)
 
         tk.Label(s, text="ACCIONES", bg=self.t["BG_PANEL"], fg=self.t["TEXT_SEC"],
                  font=("Consolas", 8, "bold")).pack(anchor="w", padx=18, pady=(22, 6))
@@ -274,52 +308,9 @@ class WindowsSecurityAuditorUI:
         self._sbtn(s, "📄  Exportar HTML",   lambda: self.export_report("html"))
         self._sbtn(s, "{ }  Exportar JSON",  lambda: self.export_report("json"))
         self._sbtn(s, "📝  Exportar TXT",    lambda: self.export_report("txt"))
-        self._sbtn(s, "🧾  Exportar Fix Log", self.export_fix_log)
         self._sbtn(s, "🗑  Limpiar",         self.clear_all)
 
         tk.Frame(s, bg=self.t["BORDER"], height=1).pack(fill="x", padx=18, pady=14)
-
-        tk.Label(s, text="MODO DE EJECUCION", bg=self.t["BG_PANEL"], fg=self.t["TEXT_SEC"],
-                 font=("Consolas", 8, "bold")).pack(anchor="w", padx=18, pady=(0, 6))
-        mode_frame = tk.Frame(s, bg=self.t["BG_PANEL"])
-        mode_frame.pack(fill="x", padx=18, pady=(0, 8))
-        tk.Radiobutton(
-            mode_frame,
-            text="Auditoria (solo lectura)",
-            variable=self.remediation_mode,
-            value=False,
-            bg=self.t["BG_PANEL"],
-            fg=self.t["TEXT_PRI"],
-            selectcolor=self.t["BG_HOVER"],
-            activebackground=self.t["BG_PANEL"],
-            font=("Consolas", 9),
-            indicatoron=True,
-            command=self._on_mode_change
-        ).pack(anchor="w", pady=1)
-        tk.Radiobutton(
-            mode_frame,
-            text="Remediacion (Fix activo)",
-            variable=self.remediation_mode,
-            value=True,
-            bg=self.t["BG_PANEL"],
-            fg=self.t["GREEN"],
-            selectcolor=self.t["BG_HOVER"],
-            activebackground=self.t["BG_PANEL"],
-            font=("Consolas", 9, "bold"),
-            indicatoron=True,
-            command=self._on_mode_change
-        ).pack(anchor="w", pady=1)
-        self.mode_lbl = tk.Label(
-            s,
-            text="Modo actual: Auditoria",
-            bg=self.t["BG_PANEL"],
-            fg=self.t["YELLOW"],
-            font=("Consolas", 8, "bold")
-        )
-        self.mode_lbl.pack(anchor="w", padx=18, pady=(0, 8))
-        self._on_mode_change()
-
-        tk.Frame(s, bg=self.t["BORDER"], height=1).pack(fill="x", padx=18, pady=8)
 
         # ── FILTRO ──
         tk.Label(s, text="FILTRAR SEVERIDAD", bg=self.t["BG_PANEL"], fg=self.t["TEXT_SEC"],
@@ -355,25 +346,6 @@ class WindowsSecurityAuditorUI:
                                 command=self._apply_schedule)
             rb.pack(anchor="w", pady=1)
 
-        # ── LOGO ──
-        logo_path = Path(__file__).with_name("logo.png")
-        if logo_path.exists():
-            try:
-                base = tk.PhotoImage(file=str(logo_path))
-                cropped = tk.PhotoImage()
-                cropped.tk.call(cropped, "copy", base, "-from", 160, 80, 860, 650)
-                img = cropped.subsample(4, 4)
-                lbl = tk.Label(s, image=img, bg=self.t["BG_PANEL"], bd=0, highlightthickness=0)
-                lbl.image = img
-                lbl._base = base
-                lbl._cropped = cropped
-                lbl.pack(side="bottom", pady=20)
-            except Exception:
-                pass
-
-        tk.Label(s, text="SOC Edition", bg=self.t["BG_PANEL"],
-                 fg=self.t["TEXT_SEC"], font=("Consolas", 8)).pack(side="bottom", pady=4)
-
     def _sbtn(self, parent, text, cmd, fg=None):
         fg = fg or self.t["TEXT_PRI"]
         btn = tk.Button(parent, text=text, command=cmd,
@@ -389,33 +361,30 @@ class WindowsSecurityAuditorUI:
         btn.bind("<Leave>", on_leave)
         return btn
 
-    def _on_mode_change(self):
-        if hasattr(self, "mode_lbl"):
-            if self.remediation_mode.get():
-                self.mode_lbl.config(text="Modo actual: Remediacion", fg=self.t["GREEN"])
-            else:
-                self.mode_lbl.config(text="Modo actual: Auditoria", fg=self.t["YELLOW"])
-
     # ─── METRIC ROW ───
     def _build_metric_row(self, parent):
         row = tk.Frame(parent, bg=self.t["BG_DEEP"])
         row.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 0))
 
+        for i in range(6):
+            row.columnconfigure(i, weight=1, minsize=90)
+        row.columnconfigure(6, weight=0)
+
         kw = {"bg": self.t["BG_CARD"], "border": self.t["BORDER"]}
-        self.card_score    = MetricCard(row, "SCORE",     "—",    self.t["RED"],    **kw, width=130)
-        self.card_critical = MetricCard(row, "CRÍTICOS",  "0",    "#ff3b5c",        **kw, width=110)
-        self.card_high     = MetricCard(row, "ALTOS",     "0",    "#ff6b35",        **kw, width=110)
-        self.card_medium   = MetricCard(row, "MEDIOS",    "0",    self.t["YELLOW"], **kw, width=110)
-        self.card_low      = MetricCard(row, "BAJOS",     "0",    self.t["GREEN"],  **kw, width=110)
-        self.card_status   = MetricCard(row, "ESTADO",    "LISTO",self.t["ACCENT"], **kw, width=130)
+        self.card_score    = MetricCard(row, "SCORE",     "—",    self.t["RED"],    **kw)
+        self.card_critical = MetricCard(row, "CRÍTICOS",  "0",    "#ff3b5c",        **kw)
+        self.card_high     = MetricCard(row, "ALTOS",     "0",    "#ff6b35",        **kw)
+        self.card_medium   = MetricCard(row, "MEDIOS",    "0",    self.t["YELLOW"], **kw)
+        self.card_low      = MetricCard(row, "BAJOS",     "0",    self.t["GREEN"],  **kw)
+        self.card_status   = MetricCard(row, "ESTADO",    "LISTO",self.t["ACCENT"], **kw)
+
+        cards = [self.card_score, self.card_critical, self.card_high,
+                 self.card_medium, self.card_low, self.card_status]
+        for i, w in enumerate(cards):
+            w.grid(row=0, column=i, sticky="nsew", padx=(0, 6), ipady=10)
 
         self.chart = SeverityChart(row, bg=self.t["BG_CARD"], size=90)
-
-        for w in [self.card_score, self.card_critical, self.card_high,
-                  self.card_medium, self.card_low, self.card_status]:
-            w.pack(side="left", padx=(0, 8))
-
-        self.chart.pack(side="left", padx=(8, 0))
+        self.chart.grid(row=0, column=6, padx=(6, 0))
 
     # ─── PROGRESS BAR ───
     def _build_progress_bar(self, parent):
@@ -436,9 +405,17 @@ class WindowsSecurityAuditorUI:
                                     highlightthickness=0)
         self.bar_canvas.pack(fill="x", pady=(4, 0))
 
-        # module chips
-        self.step_frame = tk.Frame(f, bg=self.t["BG_DEEP"])
-        self.step_frame.pack(fill="x", pady=(5, 0))
+        # module chips — horizontal scrollable canvas (no scrollbar visible)
+        chips_canvas = tk.Canvas(f, bg=self.t["BG_DEEP"], height=22,
+                                 highlightthickness=0)
+        chips_canvas.pack(fill="x", pady=(5, 0))
+
+        self.step_frame = tk.Frame(chips_canvas, bg=self.t["BG_DEEP"])
+        chips_canvas.create_window((0, 0), window=self.step_frame, anchor="nw")
+
+        def _chips_configure(_):
+            chips_canvas.configure(scrollregion=chips_canvas.bbox("all"))
+        self.step_frame.bind("<Configure>", _chips_configure)
 
         modules = ["system_info", "users", "password_policy", "network",
                    "smb_shares", "processes", "signatures",
@@ -448,7 +425,7 @@ class WindowsSecurityAuditorUI:
         for m in modules:
             lbl = tk.Label(self.step_frame, text=m.replace("_", " "),
                            bg=self.t["BG_DEEP"], fg=self.t["TEXT_SEC"],
-                           font=("Consolas", 7), padx=5, pady=2,
+                           font=("Consolas", 7), padx=4, pady=1,
                            highlightbackground=self.t["BORDER"], highlightthickness=1)
             lbl.pack(side="left", padx=2)
             self._step_labels[m] = lbl
@@ -677,7 +654,7 @@ class WindowsSecurityAuditorUI:
 
         self.count_lbl.config(text=f"{len(findings)} hallazgo(s)")
         for i, f in enumerate(findings):
-            FindingRow(self.findings_frame, f, i, self.t, on_fix=self._attempt_fix)
+            FindingRow(self.findings_frame, f, i, self.t)
 
     def _apply_filter(self):
         sev = self.filter_sev.get()
@@ -698,220 +675,77 @@ class WindowsSecurityAuditorUI:
                  font=("Consolas", 10)).pack(anchor="w", padx=14)
 
     # ─── REMEDIATION ───
-    def _quote_exe_path(self, raw_path):
-        match = re.match(r"^(.+?\.exe)\b(.*)$", raw_path.strip(), re.IGNORECASE)
-        if not match:
-            return None
-        exe = match.group(1).strip().strip('"')
-        args = match.group(2).strip()
-        if " " in exe:
-            return f'"{exe}" {args}'.strip()
-        return None
-
-    def _get_fix_action(self, finding):
-        title = finding.get("title", "")
-        details = finding.get("details", "")
-        title_l = title.lower()
-
-        if "firewall desactivado" in title_l:
-            return (
-                "Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True",
-                "Firewall habilitado en todos los perfiles."
-            )
-
-        if "protocolo inseguro activo: telnet" in title_l:
-            return (
-                "Set-Service -Name TlntSvr -StartupType Disabled -ErrorAction SilentlyContinue; "
-                "Stop-Service -Name TlntSvr -Force -ErrorAction SilentlyContinue",
-                "Telnet deshabilitado."
-            )
-
-        if "protocolo inseguro activo: ftp" in title_l:
-            return (
-                "Set-Service -Name FTPSVC -StartupType Disabled -ErrorAction SilentlyContinue; "
-                "Stop-Service -Name FTPSVC -Force -ErrorAction SilentlyContinue",
-                "Servicio FTP deshabilitado."
-            )
-
-        if "puerto del sistema expuesto" in title_l or "puerto sensible en escucha" in title_l:
-            m = re.search(r"\((\d+)\)", title)
-            if m:
-                port = m.group(1)
-                return (
-                    f"if (-not (Get-NetFirewallRule -DisplayName 'WVS Block Port {port}' -ErrorAction SilentlyContinue)) "
-                    f"{{ New-NetFirewallRule -DisplayName 'WVS Block Port {port}' -Direction Inbound -Action Block -Protocol TCP -LocalPort {port} }}",
-                    f"Regla de firewall creada para bloquear el puerto {port}."
-                )
-
-        if "cuenta invitado habilitada" in title_l:
-            user = title.split(":")[-1].strip()
-            return (f"Disable-LocalUser -Name '{user}'", f"Cuenta {user} deshabilitada.")
-
-        if "passwordrequired=false" in title_l:
-            user = title.split(":")[-1].strip()
-            return (
-                f"net user \"{user}\" /passwordreq:yes",
-                f"Cuenta {user} configurada para requerir contraseña."
-            )
-
-        if "politica de contrasena debil" in title_l:
-            return ("net accounts /minpwlen:12", "Longitud mínima de contraseña actualizada.")
-
-        if "contrasenas sin rotacion adecuada" in title_l:
-            return ("net accounts /maxpwage:90", "Expiración máxima de contraseña ajustada a 90 días.")
-
-        if "sin bloqueo de cuenta por intentos fallidos" in title_l:
-            return ("net accounts /lockoutthreshold:5", "Bloqueo por intentos fallidos configurado.")
-
-        if "historial de contrasenas bajo" in title_l:
-            return ("net accounts /uniquepw:10", "Historial de contraseñas configurado a 10.")
-
-        if "smbv1 habilitado" in title_l:
-            return (
-                "Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force",
-                "SMBv1 deshabilitado."
-            )
-
-        if "sesiones nulas smb no restringidas" in title_l:
-            return (
-                "Set-SmbServerConfiguration -RestrictNullSessAccess $true -Force",
-                "Sesiones nulas SMB restringidas."
-            )
-
-        if "recursos compartidos adicionales detectados" in title_l:
-            return (
-                "Get-SmbShare | Where-Object { $_.Name -notmatch '^[A-Z]\\$$|^ADMIN\\$$|^IPC\\$$' } | "
-                "ForEach-Object { Set-SmbShare -Name $_.Name -EncryptData $true -FolderEnumerationMode AccessBased -Force }",
-                "Shares adicionales endurecidos (cifrado y acceso por permisos)."
-            )
-
-        if "proceso ejecutandose desde ruta sospechosa" in title_l:
-            name = title.split(":")[-1].strip()
-            return (
-                f"Get-Process -Name '{name}' -ErrorAction SilentlyContinue | Stop-Process -Force",
-                f"Proceso {name} finalizado (si estaba activo)."
-            )
-
-        if "lolbin activo:" in title_l:
-            raw = title.split(":", 1)[-1].strip()
-            name = raw.split("(")[0].strip()
-            return (
-                f"Get-Process -Name '{name}' -ErrorAction SilentlyContinue | Stop-Process -Force",
-                f"Procesos {name} finalizados (si estaban activos)."
-            )
-
-        if "ejecutable con firma invalida" in title_l:
-            raw = title.split(":", 1)[-1].strip()
-            name = raw.split("(")[0].strip()
-            return (
-                f"Get-Process -Name '{name}' -ErrorAction SilentlyContinue | Stop-Process -Force",
-                f"Proceso {name} finalizado para contención inicial."
-            )
-
-        if "actualizaciones pendientes" in title_l:
-            return (
-                "UsoClient StartScan; Start-Sleep -Seconds 3; UsoClient StartDownload; Start-Sleep -Seconds 3; UsoClient StartInstall",
-                "Secuencia de Windows Update iniciada."
-            )
-
-        if "persistencia sospechosa en registro" in title_l:
-            return (
-                "$rk='HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'; "
-                "$obj=Get-ItemProperty -Path $rk; "
-                "$obj.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' -and ($_.Value -match '(?i)\\\\temp\\\\|\\\\public\\\\') } | "
-                "ForEach-Object { Remove-ItemProperty -Path $rk -Name $_.Name -Force }",
-                "Entradas sospechosas en Run key eliminadas (temp/public)."
-            )
-
-        if "persistencia sospechosa en carpeta startup" in title_l:
-            return (
-                "$sp=\"$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\"; "
-                "Get-ChildItem $sp -File -ErrorAction SilentlyContinue | "
-                "Where-Object { $_.FullName -match '(?i)\\\\temp\\\\|\\\\public\\\\|\\.ps1$' } | "
-                "Remove-Item -Force",
-                "Elementos sospechosos eliminados de Startup."
-            )
-
-        if "ruta de servicio sin comillas" in title_l:
-            svc = title.split(":")[-1].strip()
-            quoted = self._quote_exe_path(details)
-            if quoted:
-                return (
-                    f"sc.exe config \"{svc}\" binPath= \"{quoted}\"",
-                    f"Ruta de servicio {svc} corregida con comillas."
-                )
-
-        if "servicio desde ruta sospechosa" in title_l:
-            svc = title.split(":")[-1].strip()
-            return (
-                f"Set-Service -Name \"{svc}\" -StartupType Disabled -ErrorAction SilentlyContinue; "
-                f"Stop-Service -Name \"{svc}\" -Force -ErrorAction SilentlyContinue",
-                f"Servicio {svc} detenido y deshabilitado."
-            )
-
-        return None
-
     def _attempt_fix(self, finding):
-        if not self.remediation_mode.get():
-            messagebox.showinfo(
-                "Modo Auditoria",
-                "El modo actual es Auditoria (solo lectura).\n\n"
-                "Cambia a 'Remediacion (Fix activo)' para ejecutar comandos."
-            )
+        title     = finding["title"]
+        title_l   = title.lower()
+
+        cmd = msg = None
+
+        # Fixes estáticos por palabra clave
+        static = {
+            "smbv1":    ('powershell -Command "Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force"',
+                         "SMBv1 deshabilitado."),
+            "firewall": ('netsh advfirewall set allprofiles state on',
+                         "Firewall activado."),
+        }
+        for key, (c, m) in static.items():
+            if key in title_l:
+                cmd, msg = c, m
+                break
+
+        # Fix: cuenta invitado habilitada → deshabilitarla
+        if cmd is None and "cuenta invitado habilitada" in title_l:
+            username = title.split(":")[-1].strip() or "Guest"
+            cmd = f'powershell -Command "Disable-LocalUser -Name \'{username}\'"'
+            msg  = f"Cuenta '{username}' deshabilitada."
+
+        # Fix dinámico: usuario sin contraseña requerida
+        # Usa Set-LocalUser (PowerShell) en lugar de net user para mayor compatibilidad
+        if cmd is None and "sin contrasena requerida" in title_l:
+            username = title.split(":")[-1].strip()
+            cmd = (f'powershell -Command "'
+                   f'try {{ Set-LocalUser -Name \'{username}\' -PasswordRequired $true -ErrorAction Stop; '
+                   f'Write-Host OK }} '
+                   f'catch {{ Write-Error $_.Exception.Message }}"')
+            msg = f"Contraseña requerida activada para '{username}'."
+
+        # Fix: Windows Update → abrir y lanzar búsqueda de actualizaciones
+        if cmd is None and "actualizacion" in title_l:
+            cmd = ('powershell -Command "'
+                   'Start-Process ms-settings:windowsupdate-action; '
+                   'Start-Sleep -Seconds 2; '
+                   '(New-Object -ComObject Microsoft.Update.AutoUpdate).DetectNow()"')
+            msg = "Windows Update iniciado. Revisa la ventana de configuración."
+
+        if cmd is None:
+            messagebox.showinfo("Sin fix automático",
+                                f"No hay fix automático para:\n{title}\n\n"
+                                f"Recomendación:\n{finding['recommendation']}")
             return
 
-        action = self._get_fix_action(finding)
-        if not action:
-            messagebox.showinfo(
-                "Remediation",
-                f"No hay fix automático seguro para:\n{finding['title']}\n\n"
-                f"Recomendación:\n{finding['recommendation']}"
-            )
-            return
-
-        cmd, msg = action
         confirm = messagebox.askyesno(
-            "Confirmar fix",
-            f"¿Quieres resolver este hallazgo ahora?\n\n{finding['title']}\n\nComando:\n{cmd}"
-        )
+            "⚠️  Confirmar fix",
+            f"Se ejecutará el siguiente comando con privilegios de administrador:\n\n"
+            f"  {cmd}\n\n¿Continuar?")
         if not confirm:
             return
 
         try:
-            encoded_cmd = base64.b64encode(cmd.encode("utf-16le")).decode("ascii")
-            runner = (
-                "$isAdmin = ([Security.Principal.WindowsPrincipal] "
-                "[Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole("
-                "[Security.Principal.WindowsBuiltInRole]::Administrator); "
-                f"$payload = '{encoded_cmd}'; "
-                "if (-not $isAdmin) { "
-                "Start-Process powershell -Verb RunAs -ArgumentList @("
-                "'-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$payload"
-                ") -Wait; "
-                "if ($LASTEXITCODE) { exit $LASTEXITCODE } else { exit 0 } "
-                "} "
-                "$decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($payload)); "
-                "& ([ScriptBlock]::Create($decoded))"
-            )
-
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
             result = subprocess.run(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", runner],
-                capture_output=True,
-                text=True
-            )
+                cmd, shell=True, capture_output=True, text=True,
+                startupinfo=si, creationflags=subprocess.CREATE_NO_WINDOW)
             if result.returncode == 0:
-                self._append_fix_history(finding, cmd, True, result.stdout)
-                messagebox.showinfo("Fix aplicado", msg)
-                if not self.is_scanning:
-                    self.start_scan()
+                messagebox.showinfo("✅  Fix aplicado", msg)
             else:
-                stderr = (result.stderr or "").strip()
-                stdout = (result.stdout or "").strip()
-                error_msg = stderr or stdout or "Error desconocido."
-                self._append_fix_history(finding, cmd, False, error_msg)
-                messagebox.showerror("Error", f"No se pudo aplicar:\n{error_msg}")
+                err = result.stderr.strip() or result.stdout.strip()
+                messagebox.showerror(
+                    "Error al aplicar fix",
+                    f"Código de salida: {result.returncode}\n\n{err}\n\n"
+                    "Asegúrate de ejecutar el programa como Administrador.")
         except Exception as e:
-            self._append_fix_history(finding, cmd, False, str(e))
             messagebox.showerror("Error", str(e))
 
     # ─── SYSTEM INFO PANEL ───
@@ -944,39 +778,6 @@ class WindowsSecurityAuditorUI:
                      fg=self.t["TEXT_PRI"], font=("Consolas", 10)).pack(side="left")
 
     # ─── HISTORY ───
-    def _append_fix_history(self, finding, command, success, output):
-        entry = {
-            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "title": finding.get("title", ""),
-            "severity": finding.get("severity", ""),
-            "command": command,
-            "success": bool(success),
-            "output": (output or "")[:1500],
-            "user": os.getenv("USERNAME", "unknown"),
-        }
-        try:
-            with FIX_HISTORY_FILE.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except Exception as e:
-            self.logger.error(f"No se pudo escribir fix_history.jsonl: {e}")
-
-    def export_fix_log(self):
-        if not FIX_HISTORY_FILE.exists():
-            messagebox.showinfo("Fix Log", "Aun no hay fixes registrados.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".jsonl",
-            filetypes=[("JSON Lines", "*.jsonl"), ("TXT", "*.txt")]
-        )
-        if not path:
-            return
-        try:
-            content = FIX_HISTORY_FILE.read_text(encoding="utf-8")
-            Path(path).write_text(content, encoding="utf-8")
-            messagebox.showinfo("Fix Log", f"Bitacora exportada:\n{path}")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-
     def _save_history(self, score, findings):
         history = []
         if HISTORY_FILE.exists():
@@ -991,6 +792,7 @@ class WindowsSecurityAuditorUI:
             "total":    len(findings),
             "critical": sum(1 for f in findings if f["severity"] == "critical"),
             "high":     sum(1 for f in findings if f["severity"] == "high"),
+            "findings": findings,
         }
         history.insert(0, entry)
         history = history[:50]  # keep last 50
@@ -1044,11 +846,72 @@ class WindowsSecurityAuditorUI:
                          font=("Consolas", 10), width=12,
                          anchor="w").pack(side="left", padx=8, pady=5)
 
+            if entry.get("findings"):
+                btn = tk.Button(row, text="Ver ▶", bg=self.t["BG_HOVER"], fg=self.t["ACCENT"],
+                                font=("Consolas", 8, "bold"), bd=0, padx=8, pady=2,
+                                cursor="hand2",
+                                command=lambda e=entry: self._show_history_detail(e))
+                btn.pack(side="right", padx=(0, 10), pady=4)
+
     def _clear_history(self):
         if messagebox.askyesno("Limpiar historial", "¿Eliminar todo el historial?"):
             if HISTORY_FILE.exists():
                 HISTORY_FILE.unlink()
             self._load_history_ui()
+
+    def _show_history_detail(self, entry):
+        findings = entry.get("findings", [])
+        if not findings:
+            messagebox.showinfo("Sin datos", "Este escaneo no tiene hallazgos guardados.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Detalle — {entry['date']}")
+        win.geometry("950x620")
+        win.configure(bg=self.t["BG_DEEP"])
+        win.grab_set()
+        win.focus_set()
+
+        hdr = tk.Frame(win, bg=self.t["BG_PANEL"])
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=f"  Escaneo: {entry['date']}",
+                 bg=self.t["BG_PANEL"], fg=self.t["TEXT_PRI"],
+                 font=("Consolas", 11, "bold")).pack(side="left", padx=14, pady=10)
+        score_c = (self.t["GREEN"] if entry["score"] <= 30
+                   else self.t["YELLOW"] if entry["score"] <= 60
+                   else self.t["RED"])
+        tk.Label(hdr, text=f"Score: {entry['score']}%",
+                 bg=self.t["BG_PANEL"], fg=score_c,
+                 font=("Consolas", 11, "bold")).pack(side="left", padx=10)
+        tk.Label(hdr, text=f"{entry['total']} hallazgos",
+                 bg=self.t["BG_PANEL"], fg=self.t["TEXT_SEC"],
+                 font=("Consolas", 10)).pack(side="left", padx=10)
+        tk.Button(hdr, text="✕ Cerrar", command=win.destroy,
+                  bg=self.t["BG_CARD"], fg=self.t["RED"],
+                  font=("Consolas", 9), bd=0, padx=10,
+                  cursor="hand2").pack(side="right", padx=14)
+        tk.Frame(win, bg=self.t["ACCENT"], height=2).pack(fill="x")
+
+        outer = tk.Frame(win, bg=self.t["BG_PANEL"],
+                         highlightbackground=self.t["BORDER"], highlightthickness=1)
+        outer.pack(fill="both", expand=True, padx=16, pady=16)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        c = tk.Canvas(outer, bg=self.t["BG_PANEL"], highlightthickness=0)
+        c.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(outer, orient="vertical", command=c.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        c.configure(yscrollcommand=sb.set)
+
+        inner = tk.Frame(c, bg=self.t["BG_PANEL"])
+        wid = c.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda _: c.configure(scrollregion=c.bbox("all")))
+        c.bind("<Configure>", lambda e: c.itemconfig(wid, width=e.width))
+        win.bind("<MouseWheel>", lambda e: c.yview_scroll(-1 * (e.delta // 120), "units"))
+
+        for i, f in enumerate(findings):
+            FindingRow(inner, f, i, self.t)
 
     # ─── SCHEDULE ───
     def _apply_schedule(self):
@@ -1082,9 +945,16 @@ class WindowsSecurityAuditorUI:
                 f'[System.Windows.Forms.ToolTipIcon]::Warning); '
                 f'Start-Sleep -s 5; $n.Dispose()'
             )
+            _si = subprocess.STARTUPINFO()
+            _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            _si.wShowWindow = subprocess.SW_HIDE
             subprocess.Popen(
                 ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script],
-                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                startupinfo=_si,
+                creationflags=0x08000000,
             )
         except Exception:
             pass  # notificaciones no críticas
@@ -1145,14 +1015,17 @@ class WindowsSecurityAuditorUI:
 
     # ─── THEME TOGGLE ───
     def toggle_theme(self):
+        was_scanning = self.is_scanning
         new = "light" if self.theme_name.get() == "dark" else "dark"
         self.theme_name.set(new)
         self.t = THEMES[new]
-        # rebuild UI
         for w in self.root.winfo_children():
             w.destroy()
         self.root.configure(bg=self.t["BG_DEEP"])
         self._build()
+        if was_scanning:
+            self.scan_btn.config(text="⏳  Escaneando...", state="disabled")
+            self.card_status.update("SCAN", self.t["ACCENT"])
 
 
 # ─────────────────────────────────────────────

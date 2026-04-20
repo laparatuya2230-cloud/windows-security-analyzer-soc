@@ -166,12 +166,8 @@ class SecurityAnalyzer:
         users = users_data.get("users_full", []) or []
         admins = {u.lower() for u in (users_data.get("admins", []) or [])}
 
-        system_accounts = {
-            "defaultaccount",
-            "wdagutilityaccount",
-            "invitado",
-            "guest",
-        }
+        # Cuentas gestionadas por el sistema donde PasswordRequired=False es normal
+        system_builtin = {"defaultaccount", "wdagutilityaccount"}
 
         for user in users:
             name = user.get("name", "").strip()
@@ -193,26 +189,26 @@ class SecurityAnalyzer:
                     )
                 )
 
-            if not enabled:
-                continue
-
-            if not password_required:
-                if name_l in system_accounts:
-                    severity = "review"
-                elif name_l in admins:
-                    severity = "medium"
+            # Revisar password_required (omitir cuentas gestionadas por el sistema)
+            if not password_required and name_l not in system_builtin:
+                if name_l in admins:
+                    severity = "high"
                 else:
-                    severity = "review"
+                    severity = "medium"  # siempre medium para que aparezca el botón Fix
 
                 findings.append(
                     self.build(
                         severity,
-                        f"Politica de cuenta permisiva (PasswordRequired=False): {name}",
-                        f"El usuario {name} tiene PasswordRequired=False. Esto no siempre implica contrasena vacia, pero reduce garantias de seguridad.",
-                        "Validar configuracion de la cuenta y exigir contrasena para reducir riesgo.",
+                        f"Usuario sin contrasena requerida: {name}",
+                        f"El usuario '{name}' tiene PasswordRequired=False "
+                        f"({'activo' if enabled else 'deshabilitado'}).",
+                        f'Ejecutar: net user "{name}" /passwordreq:yes',
                         ["T1078 - Valid Accounts"],
                     )
                 )
+
+            if not enabled:
+                continue
         return findings
 
     # Password Policy
@@ -343,11 +339,19 @@ class SecurityAnalyzer:
                     )
                 )
 
+        # Rutas legítimas donde LOLBins son normales (OS los usa constantemente)
+        system_lolbin_paths = ("\\system32\\", "\\syswow64\\", "\\systemapps\\")
+
         grouped_lolbins = {}
         for lolbin in procs.get("lolbins", []) or []:
             name = (lolbin.get("name") or "").lower()
             mitre_tag = LOLBINS.get(name, "T1218 - System Binary Proxy Execution")
             path = (lolbin.get("path") or "").lower()
+
+            # Skip si es un LOLBin corriendo desde su ruta legítima del sistema
+            if any(sp in path for sp in system_lolbin_paths):
+                continue
+
             suspicious = bool(path) and any(sp in path for sp in suspicious_paths)
             key = (name, path)
             if key not in grouped_lolbins:

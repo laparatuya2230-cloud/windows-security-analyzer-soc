@@ -1,7 +1,21 @@
 import locale
 import subprocess
+import sys
 import json
 from datetime import datetime
+
+
+def _si():
+    """STARTUPINFO para ocultar ventanas en Windows."""
+    if sys.platform != "win32":
+        return None
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    return si
+
+
+_NO_WIN = 0x08000000 if sys.platform == "win32" else 0
 
 
 class WindowsScanner:
@@ -13,11 +27,14 @@ class WindowsScanner:
         try:
             result = subprocess.run(
                 args,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding=self.encoding,
                 errors="replace",
-                timeout=30
+                timeout=30,
+                startupinfo=_si(),
+                creationflags=_NO_WIN,
             )
             return result.stdout
         except subprocess.TimeoutExpired:
@@ -28,60 +45,60 @@ class WindowsScanner:
             return ""
 
     def run_powershell(self, script):
-        return self.run_command(["powershell", "-NoProfile", "-NonInteractive", "-Command", script])
-
-    @staticmethod
-    def unique_preserve(lines):
-        seen = set()
-        out = []
-        for line in lines:
-            if line not in seen:
-                seen.add(line)
-                out.append(line)
-        return out
+        return self.run_command([
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle", "Hidden",
+            "-Command", script
+        ])
 
     # =========================
     # 🧠 USERS
     # =========================
     def collect_users(self):
+        import csv, io
+
         raw = self.run_powershell(
-            "Get-LocalUser | Select Name,Enabled,PasswordRequired | ConvertTo-Csv -NoTypeInformation"
+            "Get-LocalUser | Select-Object Name,Enabled,PasswordRequired | ConvertTo-Csv -NoTypeInformation"
         )
         users_full = []
-        users_str = []
+        users_str  = []
         users_without_password = []
 
-        lines = [l.strip() for l in raw.splitlines() if l.strip()]
-        for line in lines[1:]:
-            parts = [p.strip('"') for p in line.split(",")]
-            if len(parts) >= 3:
-                name = parts[0]
-                enabled = parts[1].lower() == "true"
-                password_required = parts[2].lower() == "true"
+        try:
+            reader = csv.DictReader(io.StringIO(raw))
+            for row in reader:
+                name             = (row.get("Name") or "").strip()
+                enabled          = (row.get("Enabled") or "").strip().lower() == "true"
+                password_required = (row.get("PasswordRequired") or "").strip().lower() == "true"
+                if not name:
+                    continue
                 users_full.append({"name": name, "enabled": enabled,
                                    "password_required": password_required})
                 users_str.append(name)
                 if not password_required:
                     users_without_password.append(name)
+        except Exception:
+            pass
 
-        admins_raw = self.run_powershell(
-            "Get-LocalGroupMember -SID 'S-1-5-32-544' | Select Name | ConvertTo-Csv -NoTypeInformation"
-        )
+        # Miembros del grupo Administradores (nombre varía por idioma)
         admins = []
-        admin_lines = [l.strip() for l in admins_raw.splitlines() if l.strip()]
-        for line in admin_lines[1:]:
-            full_name = line.strip('"')
-            # Convert DESKTOP\\user -> user for consistent comparisons.
-            simple_name = full_name.split("\\")[-1].strip()
-            if simple_name:
-                admins.append(simple_name)
+        for group_name in ("Administrators", "Administradores"):
+            admin_raw = self.run_powershell(
+                f"try {{ Get-LocalGroupMember -Group '{group_name}' | "
+                "Select-Object -ExpandProperty Name }} catch {}"
+            )
+            members = [l.strip().split("\\")[-1] for l in admin_raw.splitlines() if l.strip()]
+            if members:
+                admins = members
+                break
 
         return {
             "users": users_str,
             "users_full": users_full,
             "users_without_password": users_without_password,
-            "admins": self.unique_preserve(admins),
-            "admin_group": "Administradores",
+            "admins": admins,
         }
 
     # =========================
@@ -138,7 +155,7 @@ class WindowsScanner:
     # =========================
     def collect_network(self):
         raw = self.run_command(["netstat", "-ano"])
-        unique = self.unique_preserve(raw.splitlines())
+        unique = list(set(raw.splitlines()))
         return {"listening_ports": unique}
 
     # =========================
@@ -214,22 +231,41 @@ class WindowsScanner:
     # 🔏 DIGITAL SIGNATURES
     # =========================
     def collect_signatures(self):
-        raw = self.run_powershell(
-            "Get-Process | Where-Object {$_.Path} | ForEach-Object { "
+        import csv, io, os, sys
+
+        # Nombre del propio ejecutable para excluirlo (evita que la app se detecte a sí misma)
+        own_name = os.path.splitext(os.path.basename(sys.executable))[0]
+
+        ps = (
+            "Get-Process | Where-Object { "
+            "  $_.Path -and "
+            "  $_.Path -notlike '*\\WindowsApps\\*' -and "      # Store apps: catalog signing
+            "  $_.Path -notlike '*\\Windows\\System32\\*' -and "
+            "  $_.Path -notlike '*\\Windows\\SysWOW64\\*' -and "
+            "  $_.Path -notlike '*\\Program Files\\*' -and "     # Software comercial instalado
+            "  $_.Path -notlike '*\\Program Files (x86)\\*' -and "
+            "  $_.Path -notlike '*\\Riot Games\\*' -and "        # Riot / League of Legends
+            "  $_.Path -notlike '*\\Steam\\*' -and "             # Steam / juegos
+            "  $_.Path -notlike '*\\Epic Games\\*' -and "
+            f"  $_.Name -ne '{own_name}' "
+            "} | ForEach-Object { "
             "  $sig = Get-AuthenticodeSignature $_.Path -ErrorAction SilentlyContinue; "
-            "  [PSCustomObject]@{Name=$_.Name; Path=$_.Path; Status=$sig.Status; Issuer=$sig.SignerCertificate.Issuer} "
-            "} | Where-Object {$_.Status -ne 'Valid'} | Select Name,Path,Status | ConvertTo-Csv -NoTypeInformation"
+            "  [PSCustomObject]@{Name=$_.Name; Path=$_.Path; Status=$sig.Status} "
+            "} | Where-Object {$_.Status -ne 'Valid'} "
+            "| Select-Object Name,Path,Status | ConvertTo-Csv -NoTypeInformation"
         )
+        raw = self.run_powershell(ps)
         unsigned = []
-        lines = [l.strip() for l in raw.splitlines() if l.strip()]
-        for line in lines[1:]:
-            parts = [p.strip('"') for p in line.split(",")]
-            if len(parts) >= 3:
-                unsigned.append({
-                    "name": parts[0],
-                    "path": parts[1],
-                    "status": parts[2]
-                })
+        try:
+            reader = csv.DictReader(io.StringIO(raw))
+            for row in reader:
+                name   = (row.get("Name")   or "").strip()
+                path   = (row.get("Path")   or "").strip()
+                status = (row.get("Status") or "").strip()
+                if name and path and status:
+                    unsigned.append({"name": name, "path": path, "status": status})
+        except Exception:
+            pass
         return unsigned
 
     # =========================
@@ -267,7 +303,7 @@ class WindowsScanner:
     # =========================
     def collect_tasks(self):
         raw = self.run_command(["schtasks", "/query", "/fo", "LIST", "/v"])
-        return self.unique_preserve(raw.split("\n\n"))
+        return list(set(raw.split("\n\n")))
 
     # =========================
     # ⚙️ SERVICES
@@ -297,7 +333,7 @@ class WindowsScanner:
             "reg", "query",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
         ])
-        return self.unique_preserve(raw.splitlines())
+        return list(set(raw.splitlines()))
 
     # =========================
     # 💀 STARTUP
@@ -307,40 +343,23 @@ class WindowsScanner:
             "cmd", "/c",
             "dir %APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
         ])
-        return self.unique_preserve(raw.splitlines())
+        return list(set(raw.splitlines()))
 
     # =========================
     # 🔥 FIREWALL
     # =========================
     def collect_firewall(self):
-        blocked_raw = self.run_powershell(
+        raw = self.run_powershell(
             "Get-NetFirewallRule -Enabled True -Direction Inbound -Action Block | "
             "Get-NetFirewallPortFilter | Select LocalPort,Protocol | ConvertTo-Csv -NoTypeInformation"
         )
         blocked_ports = set()
-        lines = [l.strip() for l in blocked_raw.splitlines() if l.strip()]
+        lines = [l.strip() for l in raw.splitlines() if l.strip()]
         for line in lines[1:]:
             parts = [p.strip('"') for p in line.split(",")]
             if len(parts) >= 1:
                 blocked_ports.add(parts[0])
-
-        profile_raw = self.run_powershell(
-            "Get-NetFirewallProfile | Select Name,Enabled | ConvertTo-Csv -NoTypeInformation"
-        )
-        profiles = []
-        p_lines = [l.strip() for l in profile_raw.splitlines() if l.strip()]
-        for line in p_lines[1:]:
-            parts = [p.strip('"') for p in line.split(",")]
-            if len(parts) >= 2:
-                profiles.append({
-                    "name": parts[0],
-                    "enabled": parts[1].lower() == "true",
-                })
-
-        return {
-            "blocked_ports": blocked_ports,
-            "profiles": profiles,
-        }
+        return blocked_ports
 
     # =========================
     # 🖥️ SYSTEM INFO
