@@ -420,7 +420,8 @@ class WindowsSecurityAuditorUI:
         modules = ["system_info", "users", "password_policy", "network",
                    "smb_shares", "processes", "signatures",
                    "tasks", "services", "registry_run", "startup",
-                   "firewall", "windows_update"]
+                   "firewall", "windows_update", "uac",
+                   "event_logs", "rdp_config", "suspicious_processes"]
         self._step_labels = {}
         for m in modules:
             lbl = tk.Label(self.step_frame, text=m.replace("_", " "),

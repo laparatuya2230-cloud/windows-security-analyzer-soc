@@ -549,6 +549,219 @@ class SecurityAnalyzer:
         return findings
 
     # Master
+    # UAC
+    def analyze_uac(self, results):
+        findings = []
+        uac = results.get("uac", {}) or {}
+        if not uac:
+            return findings
+
+        enable_lua          = int(uac.get("EnableLUA", 1))
+        consent_admin       = int(uac.get("ConsentPromptBehaviorAdmin", 5))
+        consent_user        = int(uac.get("ConsentPromptBehaviorUser", 3))
+        secure_desktop      = int(uac.get("PromptOnSecureDesktop", 1))
+
+        # ConsentPromptBehaviorAdmin values:
+        # 0 = Elevar sin solicitud        → CRITICAL
+        # 1 = Pedir credenciales (escritorio seguro) → SECURE
+        # 2 = Pedir consentimiento (escritorio seguro) → MEDIUM
+        # 3 = Pedir credenciales          → SECURE
+        # 4 = Pedir consentimiento        → MEDIUM
+        # 5 = Pedir consentimiento solo apps no-Windows → MEDIUM (default)
+
+        if enable_lua == 0:
+            findings.append(self.build(
+                "critical",
+                "UAC completamente deshabilitado (EnableLUA=0)",
+                "El Control de Cuentas de Usuario esta desactivado. Cualquier proceso puede "
+                "obtener privilegios de administrador sin ningun aviso.",
+                "Habilitar UAC: HKLM\\...\\Policies\\System -> EnableLUA = 1",
+                ["T1548.002 - Bypass User Account Control"],
+            ))
+            return findings  # sin UAC el resto no aplica
+
+        if consent_admin == 0:
+            findings.append(self.build(
+                "high",
+                "UAC: elevacion silenciosa sin solicitud de credenciales (Admin)",
+                "ConsentPromptBehaviorAdmin=0. Los administradores obtienen privilegios "
+                "elevados sin ningun prompt, facilitando escalada de privilegios.",
+                "Configurar ConsentPromptBehaviorAdmin a 1 (pedir credenciales) o 2 (pedir consentimiento).",
+                ["T1548.002 - Bypass User Account Control"],
+            ))
+        elif consent_admin in (2, 4, 5):
+            findings.append(self.build(
+                "medium",
+                "UAC: solo solicita confirmacion, no credenciales (Admin)",
+                f"ConsentPromptBehaviorAdmin={consent_admin}. El administrador solo hace "
+                "clic en 'Si' sin introducir contrasena, lo que reduce la proteccion.",
+                "Configurar ConsentPromptBehaviorAdmin=1 para exigir credenciales completas.",
+                ["T1548.002 - Bypass User Account Control"],
+            ))
+        # consent_admin in (1, 3) → pide credenciales → configuracion segura, no se reporta
+
+        if consent_user == 0:
+            findings.append(self.build(
+                "high",
+                "UAC: usuarios estandar elevan sin solicitud (ConsentPromptBehaviorUser=0)",
+                "Los usuarios no-administradores pueden elevar privilegios sin credenciales.",
+                "Configurar ConsentPromptBehaviorUser=3 (solicitar credenciales de administrador).",
+                ["T1548.002 - Bypass User Account Control"],
+            ))
+
+        if secure_desktop == 0:
+            findings.append(self.build(
+                "medium",
+                "UAC: escritorio seguro deshabilitado (PromptOnSecureDesktop=0)",
+                "El prompt de UAC no usa escritorio seguro, vulnerable a ataques de UI spoofing.",
+                "Habilitar PromptOnSecureDesktop=1 para mostrar el dialogo UAC en escritorio aislado.",
+                ["T1548.002 - Bypass User Account Control"],
+            ))
+
+        return findings
+
+    # Event Logs
+    def analyze_event_logs(self, results):
+        findings = []
+        ev = results.get("event_logs", {}) or {}
+        if not ev:
+            return findings
+
+        failed   = int(ev.get("failed_logins_24h", 0) or 0)
+        lockouts = int(ev.get("lockouts_24h", 0) or 0)
+        log_ok   = bool(ev.get("security_log_enabled", True))
+        log_mb   = int(ev.get("security_log_max_mb", 0) or 0)
+
+        if not log_ok:
+            findings.append(self.build(
+                "critical",
+                "Registro de seguridad de Windows deshabilitado",
+                "El Security Event Log no esta activo — no hay auditoria de eventos.",
+                "Habilitar el registro via gpedit.msc o: auditpol /set /category:* /success:enable /failure:enable",
+                ["T1562.002 - Disable Windows Event Logging"],
+            ))
+        elif log_mb < 20:
+            findings.append(self.build(
+                "medium",
+                f"Registro de seguridad con tamanio minimo ({log_mb} MB)",
+                "Un log pequeno se sobreescribe rapido, perdiendo evidencia de incidentes.",
+                "Aumentar el tamanio maximo del Security Log a 128 MB o mas.",
+                ["T1562.002 - Disable Windows Event Logging"],
+            ))
+
+        if failed > 100:
+            findings.append(self.build(
+                "critical",
+                f"Posible ataque de fuerza bruta: {failed} fallos de login en 24h (ID 4625)",
+                f"Se detectaron {failed} intentos fallidos de autenticacion en las ultimas 24 horas.",
+                "Revisar origenes, aplicar bloqueo de cuenta y alertas de seguridad.",
+                ["T1110.001 - Password Guessing", "T1110 - Brute Force"],
+            ))
+        elif failed > 20:
+            findings.append(self.build(
+                "high",
+                f"{failed} intentos de inicio de sesion fallidos en 24h (ID 4625)",
+                f"Se detectaron {failed} fallos de autenticacion en las ultimas 24 horas.",
+                "Investigar origenes e implementar politica de bloqueo de cuenta.",
+                ["T1110 - Brute Force"],
+            ))
+
+        if lockouts > 5:
+            findings.append(self.build(
+                "high",
+                f"{lockouts} bloqueos de cuenta detectados en 24h (ID 4740)",
+                "Multiples bloqueos de cuenta, posible ataque de fuerza bruta en curso.",
+                "Revisar el origen de los bloqueos con el Event ID 4740 en el Visor de eventos.",
+                ["T1110 - Brute Force"],
+            ))
+
+        return findings
+
+    # RDP / NTLM
+    def analyze_rdp(self, results):
+        findings = []
+        rdp = results.get("rdp_config", {}) or {}
+        if not rdp:
+            return findings
+
+        rdp_enabled  = bool(rdp.get("RDPEnabled", False))
+        nla          = bool(rdp.get("NLARequired", True))
+        ntlm_level   = int(rdp.get("NTLMLevel", 3) or 3)
+        wdigest      = bool(rdp.get("WDigest", False))
+        cred_guard   = bool(rdp.get("CredentialGuard", False))
+
+        if rdp_enabled and not nla:
+            findings.append(self.build(
+                "high",
+                "RDP habilitado sin autenticacion a nivel de red (NLA)",
+                "UserAuthenticationRequired=0. Sin NLA el servidor RDP es vulnerable a exploits pre-autenticacion.",
+                "Habilitar NLA en Propiedades del sistema > Conexiones remotas.",
+                ["T1021.001 - Remote Desktop Protocol"],
+            ))
+
+        if ntlm_level < 3:
+            sev = "critical" if ntlm_level <= 1 else "high"
+            findings.append(self.build(
+                sev,
+                f"Nivel de autenticacion NTLM inseguro (LmCompatibilityLevel={ntlm_level})",
+                f"Nivel {ntlm_level} permite LM/NTLMv1, vulnerable a ataques pass-the-hash y captura de hashes.",
+                "Configurar LmCompatibilityLevel=5 en gpedit.msc > Opciones de seguridad.",
+                ["T1550.002 - Pass the Hash", "T1557 - Adversary-in-the-Middle"],
+            ))
+
+        if wdigest:
+            findings.append(self.build(
+                "critical",
+                "WDigest habilitado: credenciales almacenadas en texto plano en memoria",
+                "UseLogonCredential=1. Mimikatz puede volcar contrasenas directamente desde LSASS.",
+                "Deshabilitar: HKLM\\...\\WDigest -> UseLogonCredential = 0",
+                ["T1003.001 - LSASS Memory"],
+            ))
+
+        if not cred_guard:
+            findings.append(self.build(
+                "medium",
+                "Credential Guard no habilitado",
+                "Sin Credential Guard, los hashes NTLM/Kerberos son vulnerables a volcado de credenciales.",
+                "Habilitar Credential Guard en gpedit.msc (requiere TPM 2.0 + Secure Boot).",
+                ["T1003 - OS Credential Dumping"],
+            ))
+
+        return findings
+
+    # Suspicious Processes
+    def analyze_suspicious_processes(self, results):
+        findings = []
+        procs = results.get("suspicious_processes", []) or []
+        if not procs:
+            return findings
+
+        for proc in procs:
+            path  = (proc.get("path") or "").lower()
+            name  = proc.get("name", "Unknown")
+            pid   = proc.get("pid", "?")
+
+            if "\\appdata\\local\\temp\\" in path:
+                sev, label = "high", "AppData\\Local\\Temp"
+            elif "\\appdata\\roaming\\" in path:
+                sev, label = "high", "AppData\\Roaming"
+            elif "\\downloads\\" in path:
+                sev, label = "medium", "Downloads"
+            elif "\\desktop\\" in path:
+                sev, label = "medium", "Desktop"
+            else:
+                sev, label = "medium", "ruta sospechosa"
+
+            findings.append(self.build(
+                sev,
+                f"Proceso ejecutandose desde {label}: {name}",
+                f"PID {pid} - {proc.get('path', '')}",
+                "Verificar el origen y legitimidad del ejecutable.",
+                ["T1059 - Command and Scripting Interpreter", "T1204 - User Execution"],
+            ))
+
+        return findings
+
     def analyze(self, results):
         findings = []
         findings += self.analyze_ports(results)
@@ -561,6 +774,10 @@ class SecurityAnalyzer:
         findings += self.analyze_updates(results)
         findings += self.analyze_persistence(results)
         findings += self.analyze_services(results)
+        findings += self.analyze_uac(results)
+        findings += self.analyze_event_logs(results)
+        findings += self.analyze_rdp(results)
+        findings += self.analyze_suspicious_processes(results)
 
         weights = {
             "critical": 30,

@@ -346,6 +346,116 @@ class WindowsScanner:
         return list(set(raw.splitlines()))
 
     # =========================
+    # 📋 EVENT LOGS
+    # =========================
+    def collect_event_logs(self):
+        import json
+
+        failed_raw = self.run_powershell(
+            "try { "
+            "  $s = (Get-Date).AddHours(-24); "
+            "  $n = (Get-WinEvent -FilterHashtable @{LogName='Security';Id=4625;StartTime=$s} "
+            "         -ErrorAction SilentlyContinue | Measure-Object).Count; "
+            "  Write-Output $n "
+            "} catch { Write-Output 0 }"
+        )
+        lockout_raw = self.run_powershell(
+            "try { "
+            "  $s = (Get-Date).AddHours(-24); "
+            "  $n = (Get-WinEvent -FilterHashtable @{LogName='Security';Id=4740;StartTime=$s} "
+            "         -ErrorAction SilentlyContinue | Measure-Object).Count; "
+            "  Write-Output $n "
+            "} catch { Write-Output 0 }"
+        )
+        log_info_raw = self.run_powershell(
+            "try { "
+            "  $l = Get-WinEvent -ListLog 'Security' -ErrorAction Stop; "
+            "  @{ IsEnabled=$l.IsEnabled; MaxSizeMB=[math]::Round($l.MaximumSizeInBytes/1MB) } | ConvertTo-Json "
+            "} catch { '{\"IsEnabled\":false,\"MaxSizeMB\":0}' }"
+        )
+
+        try:
+            failed = int(failed_raw.strip() or 0)
+        except Exception:
+            failed = 0
+        try:
+            lockouts = int(lockout_raw.strip() or 0)
+        except Exception:
+            lockouts = 0
+
+        log_info = {"IsEnabled": True, "MaxSizeMB": 0}
+        try:
+            log_info = json.loads(log_info_raw.strip()) if log_info_raw.strip() else log_info
+        except Exception:
+            pass
+
+        return {
+            "failed_logins_24h": failed,
+            "lockouts_24h": lockouts,
+            "security_log_enabled": bool(log_info.get("IsEnabled", True)),
+            "security_log_max_mb": int(log_info.get("MaxSizeMB", 0) or 0),
+        }
+
+    # =========================
+    # 🖧 RDP / NTLM CONFIG
+    # =========================
+    def collect_rdp_config(self):
+        import json
+        raw = self.run_powershell(
+            "$r = @{}; "
+            "try { $v = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server' "
+            "  -Name fDenyTSConnections -EA Stop).fDenyTSConnections; $r['RDPEnabled']=($v -eq 0) } "
+            "catch { $r['RDPEnabled']=$false }; "
+            "try { $v = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp' "
+            "  -Name UserAuthenticationRequired -EA Stop).UserAuthenticationRequired; $r['NLARequired']=($v -eq 1) } "
+            "catch { $r['NLARequired']=$true }; "
+            "try { $v = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Lsa' "
+            "  -Name LmCompatibilityLevel -EA Stop).LmCompatibilityLevel; $r['NTLMLevel']=[int]$v } "
+            "catch { $r['NTLMLevel']=3 }; "
+            "try { $v = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\WDigest' "
+            "  -Name UseLogonCredential -EA Stop).UseLogonCredential; $r['WDigest']=([int]$v -eq 1) } "
+            "catch { $r['WDigest']=$false }; "
+            "try { $v = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard' "
+            "  -Name EnableVirtualizationBasedSecurity -EA Stop).EnableVirtualizationBasedSecurity; $r['CredentialGuard']=([int]$v -eq 1) } "
+            "catch { $r['CredentialGuard']=$false }; "
+            "$r | ConvertTo-Json"
+        )
+        try:
+            return json.loads(raw.strip()) if raw.strip() else {}
+        except Exception:
+            return {}
+
+    # =========================
+    # 🦠 SUSPICIOUS PROCESSES
+    # =========================
+    def collect_suspicious_processes(self):
+        import csv, io
+        ps = (
+            "Get-Process | Where-Object { "
+            "  $_.Path -and ("
+            "    $_.Path -like '*\\AppData\\Local\\Temp\\*' -or "
+            "    $_.Path -like '*\\AppData\\Roaming\\*' -or "
+            "    $_.Path -like '*\\Downloads\\*' -or "
+            "    $_.Path -like '*\\Desktop\\*' -or "
+            "    $_.Path -like '*\\Public\\*' "
+            "  ) "
+            "} | Select Name,Path,Id | ConvertTo-Csv -NoTypeInformation"
+        )
+        raw = self.run_powershell(ps)
+        procs = []
+        try:
+            reader = csv.DictReader(io.StringIO(raw))
+            for row in reader:
+                name = (row.get("Name") or "").strip()
+                path = (row.get("Path") or "").strip()
+                pid  = (row.get("Id")   or "").strip()
+                if name and path:
+                    procs.append({"name": name, "path": path, "pid": pid})
+        except Exception:
+            pass
+        return procs
+
+    # =========================
     # 🔥 FIREWALL
     # =========================
     def collect_firewall(self):
@@ -360,6 +470,28 @@ class WindowsScanner:
             if len(parts) >= 1:
                 blocked_ports.add(parts[0])
         return blocked_ports
+
+    # =========================
+    # 🛡️ UAC
+    # =========================
+    def collect_uac(self):
+        import json
+        raw = self.run_powershell(
+            "$p = 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System'; "
+            "try { "
+            "  $r = Get-ItemProperty -Path $p -ErrorAction Stop; "
+            "  @{ "
+            "    EnableLUA                    = [int]$r.EnableLUA; "
+            "    ConsentPromptBehaviorAdmin   = [int]$r.ConsentPromptBehaviorAdmin; "
+            "    ConsentPromptBehaviorUser    = [int]$r.ConsentPromptBehaviorUser; "
+            "    PromptOnSecureDesktop        = [int]$r.PromptOnSecureDesktop "
+            "  } | ConvertTo-Json "
+            "} catch { '{}' }"
+        )
+        try:
+            return json.loads(raw.strip()) if raw.strip() else {}
+        except Exception:
+            return {}
 
     # =========================
     # 🖥️ SYSTEM INFO
@@ -404,8 +536,12 @@ class WindowsScanner:
             ("services",         self.collect_services),
             ("registry_run",     self.collect_registry_run),
             ("startup",          self.collect_startup),
-            ("firewall",         self.collect_firewall),
-            ("windows_update",   self.collect_pending_updates),
+            ("firewall",              self.collect_firewall),
+            ("windows_update",        self.collect_pending_updates),
+            ("uac",                   self.collect_uac),
+            ("event_logs",            self.collect_event_logs),
+            ("rdp_config",            self.collect_rdp_config),
+            ("suspicious_processes",  self.collect_suspicious_processes),
         ]
 
         results = {}
