@@ -1,4 +1,5 @@
 import re
+import hashlib
 
 MITRE_MAP = {
     "SMB": ["T1021.002 - SMB/Windows Admin Shares"],
@@ -25,12 +26,15 @@ class SecurityAnalyzer:
         self.logger = logger
 
     def build(self, severity, title, details, recommendation, mitre=None):
+        norm  = re.sub(r'\b\d+\b', '#', title.lower().strip())
+        fid   = hashlib.md5(f"{severity.lower()}:{norm}".encode()).hexdigest()[:12]
         return {
-            "severity": severity.lower(),
-            "title": title,
-            "details": details,
+            "id":             fid,
+            "severity":       severity.lower(),
+            "title":          title,
+            "details":        details,
             "recommendation": recommendation,
-            "mitre": mitre or [],
+            "mitre":          mitre or [],
         }
 
     def _extract_port_from_netstat_line(self, line):
@@ -627,55 +631,235 @@ class SecurityAnalyzer:
         if not ev:
             return findings
 
-        failed   = int(ev.get("failed_logins_24h", 0) or 0)
-        lockouts = int(ev.get("lockouts_24h", 0) or 0)
-        log_ok   = bool(ev.get("security_log_enabled", True))
-        log_mb   = int(ev.get("security_log_max_mb", 0) or 0)
+        failed_24h  = int(ev.get("failed_logins_24h",    0) or 0)
+        failed_1h   = int(ev.get("failed_logins_1h",     0) or 0)
+        lockouts    = int(ev.get("lockouts_24h",          0) or 0)
+        created     = int(ev.get("users_created_24h",     0) or 0)
+        priv        = int(ev.get("priv_logons_24h",       0) or 0)
+        offhours    = int(ev.get("offhours_logons_24h",   0) or 0)
+        remote      = int(ev.get("remote_logons_24h",     0) or 0)
+        targets     = ev.get("unique_failed_accounts",    []) or []
+        log_ok      = bool(ev.get("security_log_enabled", True))
+        log_mb      = int(ev.get("security_log_max_mb",   0) or 0)
 
+        # Estado del registro
         if not log_ok:
-            findings.append(self.build(
-                "critical",
+            findings.append(self.build("critical",
                 "Registro de seguridad de Windows deshabilitado",
-                "El Security Event Log no esta activo — no hay auditoria de eventos.",
-                "Habilitar el registro via gpedit.msc o: auditpol /set /category:* /success:enable /failure:enable",
-                ["T1562.002 - Disable Windows Event Logging"],
-            ))
+                "Security Event Log inactivo — sin auditoria de eventos.",
+                "auditpol /set /category:* /success:enable /failure:enable",
+                ["T1562.002 - Disable Windows Event Logging"]))
         elif log_mb < 20:
-            findings.append(self.build(
-                "medium",
-                f"Registro de seguridad con tamanio minimo ({log_mb} MB)",
-                "Un log pequeno se sobreescribe rapido, perdiendo evidencia de incidentes.",
-                "Aumentar el tamanio maximo del Security Log a 128 MB o mas.",
-                ["T1562.002 - Disable Windows Event Logging"],
-            ))
+            findings.append(self.build("medium",
+                f"Registro de seguridad muy pequeño ({log_mb} MB)",
+                "Se sobreescribe rapidamente, perdiendo evidencia forense.",
+                "Aumentar tamanio del Security Log a 128 MB o mas.",
+                ["T1562.002 - Disable Windows Event Logging"]))
 
-        if failed > 100:
-            findings.append(self.build(
-                "critical",
-                f"Posible ataque de fuerza bruta: {failed} fallos de login en 24h (ID 4625)",
-                f"Se detectaron {failed} intentos fallidos de autenticacion en las ultimas 24 horas.",
-                "Revisar origenes, aplicar bloqueo de cuenta y alertas de seguridad.",
-                ["T1110.001 - Password Guessing", "T1110 - Brute Force"],
-            ))
-        elif failed > 20:
-            findings.append(self.build(
-                "high",
-                f"{failed} intentos de inicio de sesion fallidos en 24h (ID 4625)",
-                f"Se detectaron {failed} fallos de autenticacion en las ultimas 24 horas.",
-                "Investigar origenes e implementar politica de bloqueo de cuenta.",
-                ["T1110 - Brute Force"],
-            ))
+        # Brute force — ventana corta (1h) es indicador más preciso de ataque activo
+        if failed_1h > 20:
+            findings.append(self.build("critical",
+                f"Ataque de fuerza bruta activo: {failed_1h} fallos en la ultima hora (4625)",
+                f"{failed_1h} intentos fallidos de autenticacion en 60 minutos.",
+                "Bloquear IP origen, aplicar lockout policy inmediatamente.",
+                ["T1110.001 - Password Guessing", "T1110 - Brute Force"]))
+        elif failed_24h > 100:
+            findings.append(self.build("critical",
+                f"Posible fuerza bruta: {failed_24h} fallos en 24h (4625)",
+                f"{failed_24h} intentos fallidos acumulados.",
+                "Revisar origenes e implementar lockout threshold.",
+                ["T1110 - Brute Force"]))
+        elif failed_24h > 20:
+            findings.append(self.build("high",
+                f"{failed_24h} intentos fallidos de login en 24h (4625)",
+                "Actividad de autenticacion elevada.",
+                "Investigar origenes.",
+                ["T1110 - Brute Force"]))
 
+        # Password spray (muchas cuentas distintas atacadas)
+        if len(targets) > 5 and failed_24h > 10:
+            preview = ", ".join(targets[:8]) + ("..." if len(targets) > 8 else "")
+            findings.append(self.build("high",
+                f"Posible password spray: {len(targets)} cuentas distintas atacadas (4625)",
+                f"Cuentas objetivo detectadas: {preview}",
+                "Revisar IP origen comun; considerar bloqueo a nivel de red.",
+                ["T1110.003 - Password Spraying"]))
+
+        # Bloqueos de cuenta
         if lockouts > 5:
-            findings.append(self.build(
-                "high",
-                f"{lockouts} bloqueos de cuenta detectados en 24h (ID 4740)",
-                "Multiples bloqueos de cuenta, posible ataque de fuerza bruta en curso.",
-                "Revisar el origen de los bloqueos con el Event ID 4740 en el Visor de eventos.",
-                ["T1110 - Brute Force"],
-            ))
+            findings.append(self.build("high",
+                f"{lockouts} bloqueos de cuenta en 24h (4740)",
+                "Multiples cuentas bloqueadas, posible ataque activo.",
+                "Revisar origen con Event ID 4740.",
+                ["T1110 - Brute Force"]))
+
+        # Creacion de usuario
+        if created > 0:
+            findings.append(self.build("critical",
+                f"Cuenta de usuario creada en las ultimas 24h (4720) x{created}",
+                f"{created} cuenta(s) nueva(s) detectada(s).",
+                "Verificar si la creacion fue autorizada.",
+                ["T1136.001 - Create Account: Local Account"]))
+
+        # Privilegios especiales (4672) — excluye SYSTEM
+        if priv > 50:
+            findings.append(self.build("high",
+                f"Asignacion masiva de privilegios: {priv} eventos (4672)",
+                f"{priv} asignaciones de privilegios especiales en 24h (sin cuentas de sistema).",
+                "Revisar Event ID 4672 para identificar cuentas no autorizadas.",
+                ["T1134 - Access Token Manipulation", "T1078 - Valid Accounts"]))
+        elif priv > 10:
+            findings.append(self.build("medium",
+                f"{priv} asignaciones de privilegios especiales en 24h (4672)",
+                "Actividad de privilegios por encima de lo normal.",
+                "Auditar Event ID 4672 en el Visor de eventos.",
+                ["T1078 - Valid Accounts"]))
+
+        # Logins fuera de horario
+        if offhours > 10:
+            findings.append(self.build("high",
+                f"{offhours} inicios de sesion fuera de horario en 24h (4624)",
+                "Logins detectados entre 23:00 y 07:00 horas.",
+                "Revisar Event ID 4624 para identificar origen y cuenta.",
+                ["T1078 - Valid Accounts"]))
+
+        # Sesiones remotas (RDP/RemoteInteractive)
+        if remote > 20:
+            findings.append(self.build("medium",
+                f"{remote} sesiones remotas interactivas en 24h (4624 tipo 10)",
+                "Volumen elevado de conexiones RemoteInteractive (RDP).",
+                "Verificar si todas las sesiones son legitimas.",
+                ["T1021.001 - Remote Desktop Protocol"]))
 
         return findings
+
+    # Auto-Login
+    def analyze_autologin(self, results):
+        findings = []
+        al = results.get("autologin", {}) or {}
+        if not al:
+            return findings
+        if str(al.get("AutoAdminLogon", "0")).strip() == "1":
+            has_pw = bool((al.get("DefaultPassword") or "").strip())
+            findings.append(self.build(
+                "critical" if not has_pw else "high",
+                "Auto-login habilitado en el sistema",
+                f"AutoAdminLogon=1, usuario: {al.get('DefaultUserName','desconocido')}, "
+                f"contrasena: {'almacenada en texto plano' if has_pw else 'no configurada'}.",
+                "Deshabilitar AutoAdminLogon o proteger con BitLocker+PIN.",
+                ["T1552.002 - Credentials in Registry"]))
+        return findings
+
+    # BitLocker
+    def analyze_bitlocker(self, results):
+        findings = []
+        volumes = results.get("bitlocker", []) or []
+        if not volumes:
+            findings.append(self.build("high",
+                "BitLocker no disponible o sin informacion",
+                "No se pudo obtener el estado de cifrado de disco.",
+                "Verificar que BitLocker este disponible y activarlo.",
+                ["T1025 - Data from Removable Media"]))
+            return findings
+        for vol in volumes:
+            status = (vol.get("status") or "").strip()
+            mount  = vol.get("mount", "?")
+            if status in ("0", "Off", "ProtectionOff"):
+                findings.append(self.build("high",
+                    f"BitLocker desactivado en {mount}",
+                    f"Unidad {mount} sin cifrado de disco activo.",
+                    "Activar BitLocker en esta unidad.",
+                    ["T1025 - Data from Removable Media"]))
+        return findings
+
+    # Correlación y alertas comportamentales
+    def detect_behavioral_alerts(self, results):
+        alerts = []
+        ev     = results.get("event_logs",      {}) or {}
+        rdp    = results.get("rdp_config",      {}) or {}
+        policy = results.get("password_policy", {}) or {}
+        dv     = results.get("defender",        {}) or {}
+        ps     = results.get("powershell_logs", {}) or {}
+        al     = results.get("autologin",       {}) or {}
+        bl     = results.get("bitlocker",       []) or []
+        upd    = results.get("windows_update",  {}) or {}
+        users  = results.get("users",           {}) or {}
+
+        failed      = int(ev.get("failed_logins_1h",  0) or ev.get("failed_logins_24h", 0) or 0)
+        created     = int(ev.get("users_created_24h", 0) or 0)
+        lockout_thr = int(policy.get("lockout_threshold", 0) or 0)
+        min_len     = int(policy.get("min_length", 8) or 8)
+        admins      = users.get("admins", []) or []
+        no_pw       = len(users.get("users_without_password", []) or [])
+        pending     = int(upd.get("pending_count", 0) or 0)
+        log_ok      = bool(ev.get("security_log_enabled", True))
+        ps_enabled  = bool(ps.get("Enabled", True))
+        auto_on     = str(al.get("AutoAdminLogon", "0")).strip() == "1"
+        bl_off      = any((v.get("status") or "").strip() in ("0", "Off", "ProtectionOff") for v in bl)
+        svc_on      = bool(dv.get("service_enabled", True))
+        rt_on       = bool(dv.get("realtime_enabled", True))
+        rdp_on      = bool(rdp.get("RDPEnabled", False))
+        nla_off     = not bool(rdp.get("NLARequired", True))
+        ntlm_lvl    = int(rdp.get("NTLMLevel", 3) or 3)
+        wdigest     = bool(rdp.get("WDigest", False))
+
+        if failed > 50 and lockout_thr == 0:
+            alerts.append(self.build("critical",
+                f"[CORRELACION] Fuerza bruta sin bloqueo de cuenta ({failed} fallos/h)",
+                "Fallos masivos de autenticacion sin ningun mecanismo de defensa activo.",
+                "Implementar lockout threshold inmediatamente.",
+                ["T1110 - Brute Force"]))
+
+        if not log_ok and not ps_enabled:
+            alerts.append(self.build("critical",
+                "[CORRELACION] Auditoria ciega: Security Log + PowerShell Log deshabilitados",
+                "Sin logs de seguridad ni PowerShell, cualquier ataque queda sin evidencia forense.",
+                "Habilitar Security Log (auditpol) y Script Block Logging via GPO.",
+                ["T1562.002 - Disable Windows Event Logging", "T1059.001 - PowerShell"]))
+
+        if (min_len < 8 or lockout_thr == 0) and no_pw > 0:
+            alerts.append(self.build("critical",
+                f"[CORRELACION] Politica debil + {no_pw} usuario(s) sin contraseña",
+                f"Longitud minima: {min_len}, lockout: {lockout_thr}. Acceso sin credenciales posible.",
+                "Reforzar politica de contraseñas y asignar contraseñas a todos los usuarios.",
+                ["T1110 - Brute Force", "T1078 - Valid Accounts"]))
+
+        if wdigest and rdp_on:
+            alerts.append(self.build("critical",
+                "[CORRELACION] WDigest activo + RDP expuesto — volcado remoto de credenciales",
+                "Credenciales en texto plano en LSASS accesibles via sesion RDP.",
+                "Deshabilitar WDigest (UseLogonCredential=0) y habilitar NLA en RDP.",
+                ["T1003.001 - LSASS Memory", "T1021.001 - Remote Desktop Protocol"]))
+
+        if auto_on and bl_off:
+            alerts.append(self.build("critical",
+                "[CORRELACION] Auto-login habilitado + disco sin cifrar",
+                "Acceso fisico permite login automatico y lectura directa de datos del disco.",
+                "Deshabilitar auto-login y activar BitLocker.",
+                ["T1552.002 - Credentials in Registry", "T1025 - Data from Removable Media"]))
+
+        if (not svc_on or not rt_on) and pending > 10:
+            alerts.append(self.build("critical",
+                f"[CORRELACION] Defender desactivado + {pending} actualizaciones pendientes",
+                "Sistema sin antimalware y con vulnerabilidades conocidas sin parchear.",
+                "Activar Defender y aplicar parches de seguridad inmediatamente.",
+                ["T1562.001 - Disable or Modify Tools", "T1190 - Exploit Public-Facing Application"]))
+
+        if rdp_on and nla_off and ntlm_lvl < 3:
+            alerts.append(self.build("critical",
+                f"[CORRELACION] RDP sin NLA + NTLM nivel {ntlm_lvl} — captura de hashes posible",
+                "Atacante puede conectar sin NLA y capturar/degradar hashes NTLM.",
+                "Habilitar NLA y configurar LmCompatibilityLevel=5.",
+                ["T1021.001 - Remote Desktop Protocol", "T1550.002 - Pass the Hash"]))
+
+        if created > 0 and len(admins) > 3:
+            alerts.append(self.build("critical",
+                f"[CORRELACION] Cuenta nueva + {len(admins)} administradores activos",
+                f"{created} cuenta(s) creada(s) con grupo Admins sobredimensionado.",
+                "Auditar cuentas de administrador y validar la nueva cuenta.",
+                ["T1136.001 - Create Account", "T1078.003 - Local Accounts"]))
+
+        return alerts
 
     # RDP / NTLM
     def analyze_rdp(self, results):
@@ -762,7 +946,98 @@ class SecurityAnalyzer:
 
         return findings
 
+    # PowerShell Logs
+    def analyze_powershell_logs(self, results):
+        findings = []
+        ps = results.get("powershell_logs", {}) or {}
+        if not ps:
+            return findings
+
+        if not ps.get("Enabled", True):
+            findings.append(self.build("medium",
+                "PowerShell Script Block Logging no disponible",
+                "No se pudieron leer logs de Microsoft-Windows-PowerShell/Operational.",
+                "Habilitar Script Block Logging via GPO: Administrative Templates > Windows PowerShell.",
+                ["T1059.001 - PowerShell"]))
+            return findings
+
+        count   = int(ps.get("Count", 0) or 0)
+        samples = ps.get("Samples", []) or []
+
+        if count > 0:
+            sev     = "critical" if count > 20 else "high"
+            preview = " | ".join(
+                (s.get("Snippet") or "")[:120] for s in samples[:3] if s.get("Snippet")
+            )
+            findings.append(self.build(sev,
+                f"Comandos PowerShell sospechosos detectados: {count} evento(s) (ID 4104)",
+                f"Patrones: IEX, DownloadString, Base64, WebClient, etc. Muestra: {preview}",
+                "Revisar Event ID 4104 en Microsoft-Windows-PowerShell/Operational e investigar el origen.",
+                ["T1059.001 - PowerShell",
+                 "T1027 - Obfuscated Files or Information",
+                 "T1105 - Ingress Tool Transfer"]))
+
+        return findings
+
+    # Windows Defender
+    def analyze_defender(self, results):
+        findings = []
+        dv = results.get("defender", {}) or {}
+        if not dv:
+            return findings
+
+        svc_on  = bool(dv.get("service_enabled",  False))
+        rt_on   = bool(dv.get("realtime_enabled",  False))
+        sig_age = int(dv.get("signature_age_days", 0) or 0)
+        susp    = dv.get("suspicious_exclusion_paths", []) or []
+        all_p   = dv.get("exclusion_paths",        []) or []
+        all_pr  = dv.get("exclusion_processes",    []) or []
+
+        if not svc_on:
+            findings.append(self.build("critical",
+                "Windows Defender completamente deshabilitado",
+                "AMServiceEnabled=False. Sin proteccion antimalware activa.",
+                "Habilitar Defender o instalar un AV alternativo.",
+                ["T1562.001 - Disable or Modify Tools"]))
+            return findings
+
+        if not rt_on:
+            findings.append(self.build("critical",
+                "Proteccion en tiempo real de Defender deshabilitada",
+                "RealTimeProtectionEnabled=False. No se detectan amenazas en tiempo real.",
+                "Habilitar proteccion en tiempo real en Seguridad de Windows.",
+                ["T1562.001 - Disable or Modify Tools"]))
+
+        if sig_age > 30:
+            findings.append(self.build("high",
+                f"Firmas de Defender muy desactualizadas ({sig_age} dias)",
+                f"Definiciones de malware con {sig_age} dias de antiguedad.",
+                "Ejecutar: Update-MpSignature o actualizar via Windows Update.",
+                ["T1562.001 - Disable or Modify Tools"]))
+        elif sig_age > 7:
+            findings.append(self.build("medium",
+                f"Firmas de Defender desactualizadas ({sig_age} dias)",
+                f"Definiciones con {sig_age} dias sin actualizar.",
+                "Actualizar las definiciones de Defender.",
+                ["T1562.001 - Disable or Modify Tools"]))
+
+        if susp:
+            findings.append(self.build("high",
+                f"Exclusiones sospechosas en Defender: {len(susp)} ruta(s)",
+                f"Rutas de riesgo excluidas del escaneo: {', '.join(susp[:5])}",
+                "Eliminar exclusiones innecesarias de Defender.",
+                ["T1562.001 - Disable or Modify Tools", "T1036 - Masquerading"]))
+        elif all_p or all_pr:
+            findings.append(self.build("medium",
+                f"Defender tiene {len(all_p)} ruta(s) y {len(all_pr)} proceso(s) excluidos",
+                "Exclusiones activas que pueden ocultar amenazas.",
+                "Auditar las exclusiones en Get-MpPreference.",
+                ["T1562.001 - Disable or Modify Tools"]))
+
+        return findings
+
     def analyze(self, results):
+        import math
         findings = []
         findings += self.analyze_ports(results)
         findings += self.analyze_firewall(results)
@@ -778,17 +1053,19 @@ class SecurityAnalyzer:
         findings += self.analyze_event_logs(results)
         findings += self.analyze_rdp(results)
         findings += self.analyze_suspicious_processes(results)
+        findings += self.analyze_autologin(results)
+        findings += self.analyze_bitlocker(results)
+        findings += self.analyze_powershell_logs(results)
+        findings += self.analyze_defender(results)
+        findings += self.detect_behavioral_alerts(results)
 
-        weights = {
-            "critical": 30,
-            "high": 20,
-            "medium": 10,
-            "low": 4,
-            "review": 2,
-            "info": 1,
-        }
-        max_per_finding = 30
-        raw_score = sum(weights.get(f.get("severity", "info"), 1) for f in findings)
-        score = 0 if not findings else min(int((raw_score / (len(findings) * max_per_finding)) * 100), 100)
+        # Sort: critical first
+        _order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "review": 4, "info": 5}
+        findings.sort(key=lambda f: _order.get(f.get("severity", "info"), 5))
+
+        # Dynamic scoring — logarithmic, based on real impact weight
+        _w = {"critical": 25, "high": 15, "medium": 7, "low": 3, "review": 1}
+        raw = sum(_w.get(f.get("severity", "info"), 1) for f in findings)
+        score = min(100, int(100 * (1 - math.exp(-raw / 40)))) if raw > 0 else 0
 
         return findings, score

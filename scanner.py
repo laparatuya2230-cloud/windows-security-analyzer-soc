@@ -351,38 +351,70 @@ class WindowsScanner:
     def collect_event_logs(self):
         import json
 
-        failed_raw = self.run_powershell(
-            "try { "
-            "  $s = (Get-Date).AddHours(-24); "
-            "  $n = (Get-WinEvent -FilterHashtable @{LogName='Security';Id=4625;StartTime=$s} "
-            "         -ErrorAction SilentlyContinue | Measure-Object).Count; "
-            "  Write-Output $n "
-            "} catch { Write-Output 0 }"
+        def _int(raw):
+            try:
+                return int(raw.strip() or 0)
+            except Exception:
+                return 0
+
+        def _count(flt, max_events=500):
+            raw = self.run_powershell(
+                f"try {{ (Get-WinEvent -FilterHashtable {flt} "
+                f"-MaxEvents {max_events} -EA SilentlyContinue | Measure-Object).Count "
+                "}} catch { 0 }"
+            )
+            return _int(raw)
+
+        s24 = "@{LogName='Security';StartTime=(Get-Date).AddHours(-24)"
+        s1  = "@{LogName='Security';StartTime=(Get-Date).AddHours(-1)"
+
+        failed_24h  = _count(s24 + ";Id=4625}")
+        failed_1h   = _count(s1  + ";Id=4625}")
+        lockouts    = _count(s24 + ";Id=4740}")
+        created     = _count(s24 + ";Id=4720}")
+
+        # 4672 — excluir cuentas de servicio del sistema
+        priv_raw = self.run_powershell(
+            "try { $e=Get-WinEvent -FilterHashtable @{LogName='Security';Id=4672;"
+            "StartTime=(Get-Date).AddHours(-24)} -MaxEvents 500 -EA SilentlyContinue; "
+            "$skip=@('SYSTEM','LOCAL SERVICE','NETWORK SERVICE'); "
+            "($e|Where-Object{$skip -notcontains $_.Properties[1].Value}|Measure-Object).Count "
+            "} catch { 0 }"
         )
-        lockout_raw = self.run_powershell(
-            "try { "
-            "  $s = (Get-Date).AddHours(-24); "
-            "  $n = (Get-WinEvent -FilterHashtable @{LogName='Security';Id=4740;StartTime=$s} "
-            "         -ErrorAction SilentlyContinue | Measure-Object).Count; "
-            "  Write-Output $n "
-            "} catch { Write-Output 0 }"
+        priv = _int(priv_raw)
+
+        # 4624 fuera de horario (23:00-07:00)
+        offhours_raw = self.run_powershell(
+            "try { $e=Get-WinEvent -FilterHashtable @{LogName='Security';Id=4624;"
+            "StartTime=(Get-Date).AddHours(-24)} -MaxEvents 500 -EA SilentlyContinue; "
+            "($e|Where-Object{$_.TimeCreated.Hour -lt 7 -or $_.TimeCreated.Hour -ge 23}|Measure-Object).Count "
+            "} catch { 0 }"
         )
+        offhours = _int(offhours_raw)
+
+        # 4624 LogonType=10 (RemoteInteractive / RDP)
+        remote_raw = self.run_powershell(
+            "try { $e=Get-WinEvent -FilterHashtable @{LogName='Security';Id=4624;"
+            "StartTime=(Get-Date).AddHours(-24)} -MaxEvents 500 -EA SilentlyContinue; "
+            "($e|Where-Object{$_.Properties[8].Value -eq 10}|Measure-Object).Count "
+            "} catch { 0 }"
+        )
+        remote = _int(remote_raw)
+
+        # Cuentas únicas objetivo en 4625 (password spray)
+        spray_raw = self.run_powershell(
+            "try { $e=Get-WinEvent -FilterHashtable @{LogName='Security';Id=4625;"
+            "StartTime=(Get-Date).AddHours(-24)} -MaxEvents 100 -EA SilentlyContinue; "
+            "($e|ForEach-Object{$_.Properties[5].Value}|Where-Object{$_}|Sort-Object -Unique) -join ',' "
+            "} catch { '' }"
+        )
+        unique_targets = [a.strip() for a in spray_raw.strip().split(",") if a.strip()]
+
         log_info_raw = self.run_powershell(
-            "try { "
-            "  $l = Get-WinEvent -ListLog 'Security' -ErrorAction Stop; "
-            "  @{ IsEnabled=$l.IsEnabled; MaxSizeMB=[math]::Round($l.MaximumSizeInBytes/1MB) } | ConvertTo-Json "
+            "try { $l=Get-WinEvent -ListLog 'Security' -EA Stop; "
+            "@{IsEnabled=$l.IsEnabled;MaxSizeMB=[math]::Round($l.MaximumSizeInBytes/1MB)} | ConvertTo-Json "
             "} catch { '{\"IsEnabled\":false,\"MaxSizeMB\":0}' }"
         )
-
-        try:
-            failed = int(failed_raw.strip() or 0)
-        except Exception:
-            failed = 0
-        try:
-            lockouts = int(lockout_raw.strip() or 0)
-        except Exception:
-            lockouts = 0
-
         log_info = {"IsEnabled": True, "MaxSizeMB": 0}
         try:
             log_info = json.loads(log_info_raw.strip()) if log_info_raw.strip() else log_info
@@ -390,11 +422,58 @@ class WindowsScanner:
             pass
 
         return {
-            "failed_logins_24h": failed,
-            "lockouts_24h": lockouts,
-            "security_log_enabled": bool(log_info.get("IsEnabled", True)),
-            "security_log_max_mb": int(log_info.get("MaxSizeMB", 0) or 0),
+            "failed_logins_24h":     failed_24h,
+            "failed_logins_1h":      failed_1h,
+            "lockouts_24h":          lockouts,
+            "users_created_24h":     created,
+            "priv_logons_24h":       priv,
+            "offhours_logons_24h":   offhours,
+            "remote_logons_24h":     remote,
+            "unique_failed_accounts": unique_targets,
+            "security_log_enabled":  bool(log_info.get("IsEnabled", True)),
+            "security_log_max_mb":   int(log_info.get("MaxSizeMB", 0) or 0),
         }
+
+    # =========================
+    # 🔑 AUTO-LOGIN
+    # =========================
+    def collect_autologin(self):
+        import json
+        raw = self.run_powershell(
+            "$p='HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon'; "
+            "try { $r=Get-ItemProperty $p -EA Stop; "
+            "@{ AutoAdminLogon=$r.AutoAdminLogon; DefaultUserName=$r.DefaultUserName; "
+            "   DefaultPassword=if($r.DefaultPassword){'SET'}else{''} } | ConvertTo-Json "
+            "} catch { '{}' }"
+        )
+        try:
+            return json.loads(raw.strip()) if raw.strip() else {}
+        except Exception:
+            return {}
+
+    # =========================
+    # 🔒 BITLOCKER
+    # =========================
+    def collect_bitlocker(self):
+        import csv, io
+        raw = self.run_powershell(
+            "try { Get-BitLockerVolume | "
+            "Select MountPoint,ProtectionStatus,EncryptionMethod,VolumeStatus "
+            "| ConvertTo-Csv -NoTypeInformation } catch { '' }"
+        )
+        volumes = []
+        try:
+            reader = csv.DictReader(io.StringIO(raw))
+            for row in reader:
+                volumes.append({
+                    "mount":      (row.get("MountPoint")      or "").strip(),
+                    "status":     (row.get("ProtectionStatus") or "").strip(),
+                    "method":     (row.get("EncryptionMethod") or "").strip(),
+                    "vol_status": (row.get("VolumeStatus")    or "").strip(),
+                })
+        except Exception:
+            pass
+        return volumes
 
     # =========================
     # 🖧 RDP / NTLM CONFIG
@@ -454,6 +533,82 @@ class WindowsScanner:
         except Exception:
             pass
         return procs
+
+    # =========================
+    # 🐚 POWERSHELL LOGS
+    # =========================
+    def collect_powershell_logs(self):
+        import json
+        ps = (
+            "try { "
+            "$log='Microsoft-Windows-PowerShell/Operational'; "
+            "$evts=Get-WinEvent -LogName $log -MaxEvents 300 -EA SilentlyContinue "
+            "  | Where-Object {$_.Id -eq 4104}; "
+            "$pat='Invoke-Expression|IEX |IEX\\(|DownloadString|DownloadFile|"
+            "FromBase64String|-EncodedCommand|-Enc |WebClient|Invoke-WebRequest|"
+            "Start-BitsTransfer|WindowStyle.*Hidden|http://|https://'; "
+            "$hits=$evts | Where-Object {$_.Message -match $pat}; "
+            "$samples=$hits | Select-Object -First 10 | ForEach-Object { "
+            "  @{Time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss');"
+            "    Snippet=(($_.Message -split \"`n\")[0..1] -join ' ').Substring(0,[math]::Min(200,($_.Message).Length))} "
+            "}; "
+            "@{Count=($hits|Measure-Object).Count;Enabled=$true;Samples=$samples} | ConvertTo-Json -Depth 3 "
+            "} catch { '{\"Count\":0,\"Enabled\":false,\"Samples\":[]}' }"
+        )
+        raw = self.run_powershell(ps)
+        try:
+            return json.loads(raw.strip()) if raw.strip() else {}
+        except Exception:
+            return {}
+
+    # =========================
+    # 🛡️ WINDOWS DEFENDER
+    # =========================
+    def collect_defender(self):
+        import json
+
+        status_raw = self.run_powershell(
+            "try { Get-MpComputerStatus | Select "
+            "AMServiceEnabled,RealTimeProtectionEnabled,AntispywareEnabled,AntivirusSignatureAge "
+            "| ConvertTo-Json } catch { '{}' }"
+        )
+        excl_raw = self.run_powershell(
+            "try { $p=Get-MpPreference; "
+            "@{Paths=@($p.ExclusionPath);Processes=@($p.ExclusionProcess);Extensions=@($p.ExclusionExtension)} "
+            "| ConvertTo-Json } catch { '{}' }"
+        )
+
+        status = {}
+        try:
+            status = json.loads(status_raw.strip()) if status_raw.strip() else {}
+        except Exception:
+            pass
+
+        excl = {}
+        try:
+            excl = json.loads(excl_raw.strip()) if excl_raw.strip() else {}
+        except Exception:
+            pass
+
+        def _list(val):
+            if not val:
+                return []
+            return [v for v in (val if isinstance(val, list) else [val]) if v]
+
+        excl_paths = _list(excl.get("Paths"))
+        excl_procs = _list(excl.get("Processes"))
+        susp_kw    = ("temp", "appdata", "public", "downloads", "desktop", "programdata", "tmp")
+        susp_paths = [p for p in excl_paths if any(k in p.lower() for k in susp_kw)]
+
+        return {
+            "service_enabled":          bool(status.get("AMServiceEnabled",        False)),
+            "realtime_enabled":         bool(status.get("RealTimeProtectionEnabled", False)),
+            "antispyware_enabled":      bool(status.get("AntispywareEnabled",       False)),
+            "signature_age_days":       int(status.get("AntivirusSignatureAge",     0) or 0),
+            "exclusion_paths":          excl_paths,
+            "exclusion_processes":      excl_procs,
+            "suspicious_exclusion_paths": susp_paths,
+        }
 
     # =========================
     # 🔥 FIREWALL
@@ -542,6 +697,10 @@ class WindowsScanner:
             ("event_logs",            self.collect_event_logs),
             ("rdp_config",            self.collect_rdp_config),
             ("suspicious_processes",  self.collect_suspicious_processes),
+            ("autologin",             self.collect_autologin),
+            ("bitlocker",             self.collect_bitlocker),
+            ("powershell_logs",       self.collect_powershell_logs),
+            ("defender",              self.collect_defender),
         ]
 
         results = {}

@@ -16,7 +16,7 @@ import tkinter as tk
 
 from analyzer import SecurityAnalyzer
 from app_logger import setup_logger
-from report_exporter import export_html, export_json, export_txt
+from report_exporter import export_html, export_json, export_txt, compare_scans
 from scanner import WindowsScanner
 
 APP_NAME    = "Windows Vuln Scanner"
@@ -183,10 +183,11 @@ class WindowsSecurityAuditorUI:
         self.scanner  = WindowsScanner(self.logger)
         self.analyzer = SecurityAnalyzer(self.logger)
 
-        self.is_scanning   = False
-        self.findings_all  = []
-        self.system_info   = {}
-        self.last_score    = 0
+        self.is_scanning      = False
+        self.findings_all     = []
+        self.system_info      = {}
+        self.last_score       = 0
+        self.last_comparison  = None
         self.filter_sev    = tk.StringVar(value="ALL")
         self.theme_name    = tk.StringVar(value="dark")
         self.schedule_var  = tk.StringVar(value="Off")
@@ -421,7 +422,9 @@ class WindowsSecurityAuditorUI:
                    "smb_shares", "processes", "signatures",
                    "tasks", "services", "registry_run", "startup",
                    "firewall", "windows_update", "uac",
-                   "event_logs", "rdp_config", "suspicious_processes"]
+                   "event_logs", "rdp_config", "suspicious_processes",
+                   "autologin", "bitlocker",
+                   "powershell_logs", "defender"]
         self._step_labels = {}
         for m in modules:
             lbl = tk.Label(self.step_frame, text=m.replace("_", " "),
@@ -526,17 +529,134 @@ class WindowsSecurityAuditorUI:
         f = tk.Frame(parent, bg=self.t["BG_DEEP"])
 
         header = tk.Frame(f, bg=self.t["BG_DEEP"])
-        header.pack(fill="x", pady=(0, 6))
+        header.pack(fill="x", pady=(0, 4))
         tk.Label(header, text="HALLAZGOS DE SEGURIDAD", bg=self.t["BG_DEEP"],
                  fg=self.t["TEXT_PRI"], font=("Consolas", 11, "bold")).pack(side="left")
         self.count_lbl = tk.Label(header, text="", bg=self.t["BG_DEEP"],
                                   fg=self.t["TEXT_SEC"], font=("Consolas", 9))
         self.count_lbl.pack(side="right")
 
+        # Executive summary + alerts (se rellena tras escaneo)
+        self.summary_frame = tk.Frame(f, bg=self.t["BG_DEEP"])
+        self.summary_frame.pack(fill="x", pady=(0, 4))
+
         _, self.findings_frame = self._scrollable(f)
 
         self._show_empty()
         return f
+
+    def _render_summary_banner(self, findings, score, comparison=None):
+        for w in self.summary_frame.winfo_children():
+            w.destroy()
+
+        counts = {s: sum(1 for f in findings if f["severity"] == s)
+                  for s in ("critical", "high", "medium", "low")}
+
+        if counts["critical"] > 0:
+            s_txt, s_col, s_bg, s_ico = "ESTADO CRÍTICO",  "#ff3b5c", "#2a0a10", "⛔"
+        elif counts["high"] > 0:
+            s_txt, s_col, s_bg, s_ico = "EN RIESGO",       "#ff6b35", "#2a1508", "⚠"
+        elif counts["medium"] > 0:
+            s_txt, s_col, s_bg, s_ico = "PRECAUCIÓN",      "#fbbf24", "#2a2008", "⚡"
+        else:
+            s_txt, s_col, s_bg, s_ico = "BAJO RIESGO",     "#10d48e", "#08251a", "✓"
+
+        banner = tk.Frame(self.summary_frame, bg=s_bg,
+                          highlightbackground=s_col, highlightthickness=1)
+        banner.pack(fill="x")
+
+        # Fila superior: status + score
+        top = tk.Frame(banner, bg=s_bg)
+        top.pack(fill="x", padx=12, pady=(9, 5))
+        tk.Label(top, text=f"{s_ico}  {s_txt}",
+                 bg=s_bg, fg=s_col, font=("Consolas", 10, "bold")).pack(side="left")
+        tk.Label(top, text=f"Score: {score}/100  |  "
+                           f"Críticos: {counts['critical']}  "
+                           f"Altos: {counts['high']}  "
+                           f"Medios: {counts['medium']}",
+                 bg=s_bg, fg=s_col, font=("Consolas", 8)).pack(side="right")
+
+        # Separador
+        tk.Frame(banner, bg=s_col, height=1).pack(fill="x", padx=12)
+
+        # Alertas: top 6 críticos + altos
+        alerts = [f for f in findings if f["severity"] in ("critical", "high")][:6]
+        if alerts:
+            af = tk.Frame(banner, bg=s_bg)
+            af.pack(fill="x", padx=12, pady=(5, 9))
+            for a in alerts:
+                col = "#ff3b5c" if a["severity"] == "critical" else "#ff6b35"
+                row = tk.Frame(af, bg=s_bg)
+                row.pack(fill="x", pady=1)
+                tk.Label(row, text=f"[{a['severity'].upper()}]",
+                         bg=s_bg, fg=col, font=("Consolas", 8, "bold"),
+                         width=11, anchor="w").pack(side="left")
+                tk.Label(row, text=a["title"][:95],
+                         bg=s_bg, fg="#e8f4ff",
+                         font=("Consolas", 8), anchor="w").pack(side="left")
+
+        # ── Sección de cambios vs escaneo anterior ──
+        if comparison:
+            new_f       = comparison.get("new",          [])
+            res_f       = comparison.get("resolved",     [])
+            wors        = comparison.get("worsened",     [])
+            impr        = comparison.get("improved",     [])
+            trend       = comparison.get("trend",        "stable")
+            narrative   = comparison.get("narrative",    "")
+            score_delta = comparison.get("score_delta")
+            prev_score  = comparison.get("prev_score")
+            curr_score  = comparison.get("curr_score")
+
+            trend_col  = {"improved": "#10d48e", "worsened": "#ff3b5c", "stable": "#6a90b8"}[trend]
+            trend_icon = {"improved": "▼ MEJORÓ", "worsened": "▲ EMPEORÓ", "stable": "— ESTABLE"}[trend]
+
+            cb = tk.Frame(self.summary_frame, bg=self.t["BG_PANEL"],
+                          highlightbackground=trend_col, highlightthickness=1)
+            cb.pack(fill="x", pady=(4, 0))
+
+            # Cabecera: Security Evolution
+            hrow = tk.Frame(cb, bg=self.t["BG_PANEL"])
+            hrow.pack(fill="x", padx=12, pady=(8, 4))
+            tk.Label(hrow, text="SECURITY EVOLUTION",
+                     bg=self.t["BG_PANEL"], fg=self.t["TEXT_SEC"],
+                     font=("Consolas", 8, "bold")).pack(side="left")
+            tk.Label(hrow, text=trend_icon,
+                     bg=self.t["BG_PANEL"], fg=trend_col,
+                     font=("Consolas", 8, "bold")).pack(side="right")
+
+            # Score delta
+            if prev_score is not None and curr_score is not None:
+                srow = tk.Frame(cb, bg=self.t["BG_PANEL"])
+                srow.pack(fill="x", padx=12, pady=(0, 4))
+                delta_txt = f"+{score_delta}" if score_delta > 0 else str(score_delta)
+                delta_col = "#ff3b5c" if score_delta > 0 else ("#10d48e" if score_delta < 0 else "#6a90b8")
+                tk.Label(srow, text=f"Score: {prev_score} → {curr_score}  ({delta_txt})",
+                         bg=self.t["BG_PANEL"], fg=delta_col,
+                         font=("Consolas", 8)).pack(side="left")
+
+            # Narrativa
+            if narrative:
+                tk.Label(cb, text=narrative[:120], bg=self.t["BG_PANEL"], fg="#a0b8d0",
+                         font=("Consolas", 7), wraplength=600, justify="left").pack(
+                             anchor="w", padx=12, pady=(0, 6))
+
+            # Cambios detallados
+            cf = tk.Frame(cb, bg=self.t["BG_PANEL"])
+            cf.pack(fill="x", padx=12, pady=(0, 8))
+
+            for label, items, col in [
+                (f"▲ Nuevos ({len(new_f)})",     new_f[:4],  "#ff6b35"),
+                (f"✓ Resueltos ({len(res_f)})",  res_f[:4],  "#10d48e"),
+                (f"▲ Empeorados ({len(wors)})",  [e["current"] for e in wors[:3]], "#ff3b5c"),
+                (f"▼ Mejorados ({len(impr)})",   [e["current"] for e in impr[:3]], "#60a5fa"),
+            ]:
+                if items:
+                    tk.Label(cf, text=label, bg=self.t["BG_PANEL"], fg=col,
+                             font=("Consolas", 8, "bold")).pack(anchor="w", pady=(3, 1))
+                    for f in items:
+                        tk.Label(cf, text=f"  [{f['severity'].upper()}] {f['title'][:80]}",
+                                 bg=self.t["BG_PANEL"], fg="#a0b8d0",
+                                 font=("Consolas", 7)).pack(anchor="w")
 
     # ── HISTORY PANEL ──
     def _build_history_panel(self, parent):
@@ -595,7 +715,19 @@ class WindowsSecurityAuditorUI:
         self.last_score   = score
         self.system_info  = results.get("system_info", {})
 
+        # Cargar escaneo anterior antes de guardar el actual
+        prev_findings, prev_score = [], None
+        if HISTORY_FILE.exists():
+            try:
+                hist = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+                if hist:
+                    prev_findings = hist[0].get("findings", [])
+                    prev_score    = hist[0].get("score")
+            except Exception:
+                pass
+
         self._save_history(score, findings)
+        self.last_comparison = compare_scans(findings, prev_findings, score, prev_score)
         self.root.after(0, lambda: self._show_results(findings, score))
 
     def _on_progress(self, current, total, module):
@@ -630,6 +762,7 @@ class WindowsSecurityAuditorUI:
         self.progress_lbl.config(text="Escaneo completado")
         self.progress_pct.config(text="100%")
 
+        self._render_summary_banner(findings, score, self.last_comparison)
         self._render_findings(findings)
         self._update_info_panel()
         self._load_history_ui()
@@ -787,6 +920,14 @@ class WindowsSecurityAuditorUI:
             except Exception:
                 history = []
 
+        # Deduplicación: no guardar si es idéntico al último escaneo
+        if history:
+            last     = history[0]
+            last_ids = sorted(f.get("id", f.get("title", "")) for f in last.get("findings", []))
+            curr_ids = sorted(f.get("id", f.get("title", "")) for f in findings)
+            if last_ids == curr_ids and last.get("score") == score:
+                return
+
         entry = {
             "date":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "score":    score,
@@ -796,8 +937,7 @@ class WindowsSecurityAuditorUI:
             "findings": findings,
         }
         history.insert(0, entry)
-        history = history[:50]  # keep last 50
-
+        history = history[:50]
         HISTORY_FILE.write_text(json.dumps(history, indent=2), encoding="utf-8")
 
     def _load_history_ui(self):
@@ -980,7 +1120,7 @@ class WindowsSecurityAuditorUI:
         si = self.system_info or {}
         try:
             if fmt == "html":
-                export_html(self.findings_all, self.last_score, si, path)
+                export_html(self.findings_all, self.last_score, si, path, self.last_comparison)
             elif fmt == "json":
                 export_json(self.findings_all, self.last_score, si, path)
             else:

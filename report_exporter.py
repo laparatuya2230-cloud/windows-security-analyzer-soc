@@ -26,7 +26,295 @@ SEV_BG = {
 }
 
 
-def export_html(findings, score, system_info=None, output_path=None):
+def compare_scans(current_findings, prev_findings, current_score=None, prev_score=None):
+    """Compara dos listas de findings usando ID único. Calcula impacto y narrativa."""
+    if not prev_findings:
+        return None
+    import re
+
+    _sev    = {"critical": 0, "high": 1, "medium": 2, "low": 3, "review": 4, "info": 5}
+    _impact = {"critical": 10, "high": 6, "medium": 3, "low": 1, "review": 0, "info": 0}
+
+    def _key(f):
+        return f.get("id") or re.sub(r'\b\d+\b', '#', f.get("title", "").lower().strip())
+
+    curr = {_key(f): f for f in current_findings}
+    prev = {_key(f): f for f in prev_findings}
+
+    new_f      = [f for k, f in curr.items() if k not in prev]
+    resolved_f = [f for k, f in prev.items() if k not in curr]
+    worsened, improved = [], []
+    for k in curr:
+        if k in prev:
+            cs = _sev.get(curr[k].get("severity", "info"), 5)
+            ps = _sev.get(prev[k].get("severity", "info"), 5)
+            if cs < ps:
+                worsened.append({"current": curr[k], "previous": prev[k]})
+            elif cs > ps:
+                improved.append({"current": curr[k], "previous": prev[k]})
+
+    # Impacto neto: positivo = mejoró, negativo = empeoró
+    impact_delta = (
+        sum(_impact.get(f["severity"], 0) for f in resolved_f)
+        + sum(_impact.get(e["previous"]["severity"], 0) - _impact.get(e["current"]["severity"], 0) for e in improved)
+        - sum(_impact.get(f["severity"], 0) for f in new_f)
+        - sum(_impact.get(e["current"]["severity"], 0) - _impact.get(e["previous"]["severity"], 0) for e in worsened)
+    )
+
+    score_delta = (current_score - prev_score) if (current_score is not None and prev_score is not None) else None
+    trend = "improved" if impact_delta > 0 else ("worsened" if impact_delta < 0 else "stable")
+
+    # Narrativa automática
+    total = len(new_f) + len(resolved_f) + len(worsened) + len(improved)
+    if total == 0:
+        narrative = "Sin cambios detectados. El perfil de riesgo permanece estable."
+    elif trend == "improved":
+        parts = []
+        if resolved_f: parts.append(f"se resolvieron {len(resolved_f)} hallazgo(s)")
+        if improved:   parts.append(f"{len(improved)} mejoraron de severidad")
+        if new_f:      parts.append(f"aunque aparecieron {len(new_f)} nuevo(s)")
+        narrative = "La seguridad mejoró: " + ", ".join(parts) + "."
+        if score_delta is not None and score_delta < 0:
+            narrative += f" El score bajó {abs(score_delta)} puntos."
+    elif trend == "worsened":
+        parts = []
+        if new_f:
+            crits = sum(1 for f in new_f if f["severity"] == "critical")
+            parts.append(f"{crits} nuevo(s) CRÍTICO(s)" if crits else f"{len(new_f)} nuevo(s) hallazgo(s)")
+        if worsened: parts.append(f"{len(worsened)} hallazgo(s) empeoraron de severidad")
+        narrative = "La seguridad empeoró: " + ", ".join(parts) + ". Revisar cambios urgentemente."
+        if score_delta is not None and score_delta > 0:
+            narrative += f" El score subió {score_delta} puntos."
+    else:
+        narrative = f"Se detectaron {total} cambio(s) con impacto neto neutro."
+
+    return {
+        "new":          new_f,
+        "resolved":     resolved_f,
+        "worsened":     worsened,
+        "improved":     improved,
+        "impact_delta": impact_delta,
+        "score_delta":  score_delta,
+        "trend":        trend,
+        "narrative":    narrative,
+        "prev_score":   prev_score,
+        "curr_score":   current_score,
+    }
+
+
+def _build_changes_section(comparison):
+    if not comparison:
+        return ""
+
+    new_f      = comparison.get("new",          [])
+    resolved_f = comparison.get("resolved",      [])
+    worsened   = comparison.get("worsened",      [])
+    improved   = comparison.get("improved",      [])
+    trend      = comparison.get("trend",         "stable")
+    narrative  = comparison.get("narrative",     "")
+    score_delta = comparison.get("score_delta")
+    prev_score  = comparison.get("prev_score")
+    curr_score  = comparison.get("curr_score")
+    impact      = comparison.get("impact_delta", 0)
+
+    trend_color = {"improved": "#10d48e", "worsened": "#ff3b5c", "stable": "#6a90b8"}[trend]
+    trend_icon  = {"improved": "▼ MEJORÓ", "worsened": "▲ EMPEORÓ", "stable": "— ESTABLE"}[trend]
+
+    # Score comparison bar
+    score_html = ""
+    if prev_score is not None and curr_score is not None:
+        delta_txt  = f"+{score_delta}" if score_delta > 0 else str(score_delta)
+        delta_col  = "#ff3b5c" if score_delta > 0 else ("#10d48e" if score_delta < 0 else "#6a90b8")
+        score_html = f"""
+      <div style="display:flex;align-items:center;gap:20px;margin-top:12px;flex-wrap:wrap;">
+        <div style="text-align:center;">
+          <div style="font-size:10px;color:#6a90b8;letter-spacing:1px;">ANTERIOR</div>
+          <div style="font-size:26px;font-weight:800;color:#6a90b8;font-family:'Share Tech Mono',monospace;">{prev_score}</div>
+        </div>
+        <div style="font-size:20px;color:{delta_col};font-weight:800;">{delta_txt}</div>
+        <div style="text-align:center;">
+          <div style="font-size:10px;color:#6a90b8;letter-spacing:1px;">ACTUAL</div>
+          <div style="font-size:26px;font-weight:800;color:{delta_col};font-family:'Share Tech Mono',monospace;">{curr_score}</div>
+        </div>
+        <div style="font-size:12px;color:{trend_color};font-weight:700;margin-left:8px;">{trend_icon}</div>
+      </div>"""
+
+    def _item(f, color):
+        return (f'<div style="margin:3px 0;font-size:12px;">'
+                f'<span style="color:{color};font-weight:700;font-size:10px;">[{f["severity"].upper()}]</span>'
+                f' <span style="color:#c8d8e8;">{f["title"]}</span></div>')
+
+    def _change_item(entry, arrow, col):
+        c, p = entry["current"], entry["previous"]
+        return (f'<div style="margin:3px 0;font-size:12px;">'
+                f'<span style="color:{SEV_COLOR.get(p["severity"],"#aaa")};font-size:10px;">{p["severity"].upper()}</span>'
+                f' <span style="color:{col};">{arrow}</span>'
+                f' <span style="color:{SEV_COLOR.get(c["severity"],"#aaa")};font-size:10px;">{c["severity"].upper()}</span>'
+                f' <span style="color:#c8d8e8;"> {c["title"]}</span></div>')
+
+    _none = '<div style="color:#3a5a7a;font-size:12px;padding:4px 0;">Ninguno</div>'
+
+    new_html      = "".join(_item(f, "#ff6b35") for f in new_f[:10])      or _none
+    resolved_html = "".join(_item(f, "#10d48e") for f in resolved_f[:10]) or _none
+    worsened_html = "".join(_change_item(e, "▲", "#ff3b5c") for e in worsened[:5]) or _none
+    improved_html = "".join(_change_item(e, "▼", "#10d48e") for e in improved[:5]) or _none
+
+    return f"""
+<!-- SECURITY EVOLUTION -->
+<div style="padding:28px 40px 0;">
+  <div style="font-size:11px;color:#6a90b8;letter-spacing:3px;text-transform:uppercase;
+              margin-bottom:16px;padding-bottom:8px;border-bottom:1px solid #1a3a5c;">
+    Security Evolution
+  </div>
+
+  <!-- Narrativa + Score -->
+  <div style="background:#0c1a2e;border-left:3px solid {trend_color};border-radius:8px;
+              padding:18px 22px;margin-bottom:16px;">
+    <div style="font-size:11px;color:{trend_color};letter-spacing:2px;margin-bottom:6px;">
+      {trend_icon} &nbsp;|&nbsp; Impacto neto: {'+' if impact>0 else ''}{impact}
+    </div>
+    <p style="color:#c8d8e8;font-size:13px;line-height:1.6;margin:0;">{narrative}</p>
+    {score_html}
+  </div>
+
+  <!-- Grid de cambios -->
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+    <div style="background:#0c1a2e;border-radius:8px;padding:14px 18px;">
+      <div style="font-size:10px;color:#ff6b35;letter-spacing:2px;margin-bottom:8px;">▲ NUEVOS ({len(new_f)})</div>
+      {new_html}
+    </div>
+    <div style="background:#0c1a2e;border-radius:8px;padding:14px 18px;">
+      <div style="font-size:10px;color:#10d48e;letter-spacing:2px;margin-bottom:8px;">✓ RESUELTOS ({len(resolved_f)})</div>
+      {resolved_html}
+    </div>
+    <div style="background:#0c1a2e;border-radius:8px;padding:14px 18px;">
+      <div style="font-size:10px;color:#ff3b5c;letter-spacing:2px;margin-bottom:8px;">▲ EMPEORADOS ({len(worsened)})</div>
+      {worsened_html}
+    </div>
+    <div style="background:#0c1a2e;border-radius:8px;padding:14px 18px;">
+      <div style="font-size:10px;color:#60a5fa;letter-spacing:2px;margin-bottom:8px;">▼ MEJORADOS ({len(improved)})</div>
+      {improved_html}
+    </div>
+  </div>
+</div>"""
+
+
+def _build_executive_summary(findings, score):
+    counts = {s: sum(1 for f in findings if f["severity"] == s)
+              for s in ("critical", "high", "medium", "low", "review")}
+
+    if counts["critical"] > 0:
+        status_label = "ESTADO CRÍTICO"
+        status_color = "#ff3b5c"
+        status_bg    = "#2a0a10"
+        status_icon  = "⛔"
+    elif counts["high"] > 0:
+        status_label = "EN RIESGO"
+        status_color = "#ff6b35"
+        status_bg    = "#2a1508"
+        status_icon  = "⚠"
+    elif counts["medium"] > 0:
+        status_label = "PRECAUCIÓN"
+        status_color = "#fbbf24"
+        status_bg    = "#2a2008"
+        status_icon  = "⚡"
+    else:
+        status_label = "BAJO RIESGO"
+        status_color = "#10d48e"
+        status_bg    = "#08251a"
+        status_icon  = "✅"
+
+    # Impacto general
+    impact_parts = []
+    titles_low = " ".join(f["title"].lower() for f in findings)
+    if "deshabilitado" in titles_low and "logging" in titles_low:
+        impact_parts.append("Los eventos de seguridad no están siendo auditados.")
+    if "defender" in titles_low and ("deshabilitado" in titles_low or "desactivad" in titles_low):
+        impact_parts.append("El sistema carece de protección antimalware activa.")
+    if "wdigest" in titles_low:
+        impact_parts.append("Las credenciales pueden ser volcadas desde la memoria.")
+    if "fuerza bruta" in titles_low or "brute" in titles_low:
+        impact_parts.append("Se detecta actividad de fuerza bruta en curso.")
+    if "rdp" in titles_low and "nla" in titles_low:
+        impact_parts.append("El servicio RDP está expuesto sin autenticación de red.")
+    if not impact_parts:
+        impact_parts.append("Se detectaron configuraciones que elevan el riesgo del sistema.")
+
+    impact_text = " ".join(impact_parts)
+
+    # Top 5
+    top5 = findings[:5]
+    top5_html = "".join(
+        f'<li style="margin:4px 0;color:{SEV_COLOR.get(f["severity"],"#aaa")};">'
+        f'<b>[{f["severity"].upper()}]</b> <span style="color:#e8f4ff">{f["title"]}</span></li>'
+        for f in top5
+    )
+
+    # Alert banners (critical only)
+    alerts_html = ""
+    for f in findings:
+        if f["severity"] not in ("critical", "high"):
+            break
+        col = SEV_COLOR.get(f["severity"], "#aaa")
+        bg  = SEV_BG.get(f["severity"], "#1a1a1a")
+        alerts_html += (
+            f'<div style="background:{bg};border-left:4px solid {col};'
+            f'padding:10px 18px;margin:6px 0;border-radius:4px;display:flex;align-items:center;gap:14px;">'
+            f'<span style="background:{col};color:#000;padding:2px 10px;border-radius:4px;'
+            f'font-size:11px;font-weight:800;white-space:nowrap;">{f["severity"].upper()}</span>'
+            f'<span style="color:#e8f4ff;font-size:13px;">{f["title"]}</span>'
+            f'</div>'
+        )
+
+    exec_html = f"""
+<!-- EXECUTIVE SUMMARY -->
+<div style="padding:32px 40px 0;">
+  <div style="font-size:11px;color:#6a90b8;letter-spacing:3px;text-transform:uppercase;
+              margin-bottom:16px;padding-bottom:8px;border-bottom:1px solid #1a3a5c;">
+    Executive Summary
+  </div>
+  <div style="display:flex;gap:24px;align-items:stretch;flex-wrap:wrap;">
+
+    <!-- Status card -->
+    <div style="background:{status_bg};border:2px solid {status_color};border-radius:10px;
+                padding:28px 32px;min-width:200px;display:flex;flex-direction:column;
+                align-items:center;justify-content:center;gap:8px;flex-shrink:0;">
+      <div style="font-size:42px;">{status_icon}</div>
+      <div style="font-size:16px;font-weight:800;color:{status_color};letter-spacing:2px;
+                  font-family:'Share Tech Mono',monospace;">{status_label}</div>
+      <div style="font-size:22px;font-weight:800;color:{status_color};
+                  font-family:'Share Tech Mono',monospace;">{score}<span style="font-size:13px;"> / 100</span></div>
+      <div style="font-size:11px;color:#6a90b8;">Score de riesgo</div>
+    </div>
+
+    <!-- Impact + Top 5 -->
+    <div style="flex:1;min-width:280px;">
+      <div style="background:#0c1a2e;border-radius:8px;padding:18px 22px;margin-bottom:14px;">
+        <div style="font-size:11px;color:#6a90b8;letter-spacing:2px;margin-bottom:8px;">IMPACTO GENERAL</div>
+        <p style="color:#c8d8e8;font-size:13px;line-height:1.6;">{impact_text}</p>
+      </div>
+      <div style="background:#0c1a2e;border-radius:8px;padding:18px 22px;">
+        <div style="font-size:11px;color:#6a90b8;letter-spacing:2px;margin-bottom:10px;">TOP 5 HALLAZGOS PRIORITARIOS</div>
+        <ul style="list-style:none;padding:0;margin:0;font-size:13px;">{top5_html}</ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ALERTS -->
+{"" if not alerts_html else f'''
+<div style="padding:24px 40px 0;">
+  <div style="font-size:11px;color:#6a90b8;letter-spacing:3px;text-transform:uppercase;
+              margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid #1a3a5c;">
+    Alertas activas
+  </div>
+  {alerts_html}
+</div>'''}
+"""
+    return exec_html
+
+
+def export_html(findings, score, system_info=None, output_path=None, comparison=None):
     """Genera un reporte HTML profesional."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     host = (system_info or {}).get("hostname", "Desconocido")
@@ -42,7 +330,7 @@ def export_html(findings, score, system_info=None, output_path=None):
 
     # ── finding rows ──
     rows_html = ""
-    for i, f in enumerate(findings):
+    for f in findings:
         sev   = f["severity"]
         color = SEV_COLOR.get(sev, "#aaa")
         bg    = SEV_BG.get(sev, "#1a1a1a")
@@ -181,6 +469,10 @@ def export_html(findings, score, system_info=None, output_path=None):
     </div>
   </div>
 </div>
+
+{_build_executive_summary(findings, score)}
+
+{_build_changes_section(comparison)}
 
 <!-- SYSTEM INFO -->
 {''.join([f"""
