@@ -176,18 +176,23 @@ class WindowsScanner:
                     "description": parts[2] if len(parts) > 2 else ""
                 })
 
-        # Check anonymous access
-        anon_raw = self.run_powershell(
-            "Get-SmbServerConfiguration | Select EnableSMB1Protocol,RestrictNullSessAccess | ConvertTo-Csv -NoTypeInformation"
-        )
-        smb1 = False
-        null_sess = True
-        anon_lines = [l.strip() for l in anon_raw.splitlines() if l.strip()]
-        if len(anon_lines) >= 2:
-            parts = [p.strip('"') for p in anon_lines[1].split(",")]
-            if len(parts) >= 2:
-                smb1 = parts[0].lower() == "true"
-                null_sess = parts[1].lower() == "true"
+        # SMBv1
+        smb1_raw = self.run_powershell(
+            "try { (Get-SmbServerConfiguration -EA Stop).EnableSMB1Protocol } catch { 'False' }"
+        ).strip().lower()
+        smb1 = smb1_raw == "true"
+
+        # Sesiones nulas — verificar registro directamente (fuente autoritativa)
+        null_reg_raw = self.run_powershell(
+            "try { (Get-ItemProperty "
+            "'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters' "
+            "-Name RestrictNullSessAccess -EA Stop).RestrictNullSessAccess "
+            "} catch { '1' }"
+        ).strip()
+        try:
+            null_sess = int(null_reg_raw) == 1
+        except Exception:
+            null_sess = True  # si no se puede leer, asumir seguro
 
         return {
             "shares": shares,
@@ -244,9 +249,11 @@ class WindowsScanner:
             "  $_.Path -notlike '*\\Windows\\SysWOW64\\*' -and "
             "  $_.Path -notlike '*\\Program Files\\*' -and "     # Software comercial instalado
             "  $_.Path -notlike '*\\Program Files (x86)\\*' -and "
-            "  $_.Path -notlike '*\\Riot Games\\*' -and "        # Riot / League of Legends
-            "  $_.Path -notlike '*\\Steam\\*' -and "             # Steam / juegos
+            "  $_.Path -notlike '*\\Riot Games\\*' -and "
+            "  $_.Path -notlike '*\\Steam\\*' -and "
             "  $_.Path -notlike '*\\Epic Games\\*' -and "
+            "  $_.Path -notlike '*.venv\\*' -and "
+            "  $_.Path -notlike '*\\Python*\\Scripts\\*' -and "
             f"  $_.Name -ne '{own_name}' "
             "} | ForEach-Object { "
             "  $sig = Get-AuthenticodeSignature $_.Path -ErrorAction SilentlyContinue; "
@@ -410,28 +417,70 @@ class WindowsScanner:
         )
         unique_targets = [a.strip() for a in spray_raw.strip().split(",") if a.strip()]
 
+        # Estado del log de seguridad
         log_info_raw = self.run_powershell(
             "try { $l=Get-WinEvent -ListLog 'Security' -EA Stop; "
-            "@{IsEnabled=$l.IsEnabled;MaxSizeMB=[math]::Round($l.MaximumSizeInBytes/1MB)} | ConvertTo-Json "
-            "} catch { '{\"IsEnabled\":false,\"MaxSizeMB\":0}' }"
+            "@{IsEnabled=$l.IsEnabled;MaxSizeMB=[math]::Round($l.MaximumSizeInBytes/1MB);ReadError=$false} | ConvertTo-Json "
+            "} catch { '{\"IsEnabled\":null,\"MaxSizeMB\":0,\"ReadError\":true}' }"
         )
-        log_info = {"IsEnabled": True, "MaxSizeMB": 0}
+        log_info = {"IsEnabled": None, "MaxSizeMB": 0, "ReadError": True}
         try:
             log_info = json.loads(log_info_raw.strip()) if log_info_raw.strip() else log_info
         except Exception:
             pass
 
+        # Estado del servicio Windows Event Log
+        svc_raw = self.run_powershell(
+            "try { (Get-Service -Name EventLog -EA Stop).Status } catch { 'Unknown' }"
+        ).strip()
+        eventlog_svc_running = svc_raw.lower() == "running"
+
+        # auditpol: GUIDs de Logon/Logoff/Special Logon (independientes del idioma)
+        # Parseo por posición de columna (col 4 = GUID, col 5 = setting) porque
+        # los nombres de columna del CSV están localizados y varían según el idioma del SO.
+        auditpol_raw = self.run_powershell(
+            "try { "
+            "$target = @('0CCE9215','0CCE9216','0CCE921B'); "
+            "$lines = auditpol /get /category:* /r 2>$null | Select-Object -Skip 1; "
+            "$found = $false; "
+            "foreach ($line in $lines) { "
+            "  foreach ($g in $target) { "
+            "    if ($line -match $g) { "
+            "      $parts = $line -split ','; "
+            "      if ($parts.Count -ge 5) { "
+            "        $setting = $parts[4].Trim().Trim('\"'); "
+            "        if ($setting -and $setting -notmatch 'No Auditing|Sin auditor|^$') { "
+            "          $found = $true; break "
+            "        } "
+            "      } "
+            "    } "
+            "  }; "
+            "  if ($found) { break } "
+            "}; "
+            "if ($found) { 'enabled' } else { 'disabled' } "
+            "} catch { 'unknown' }"
+        ).strip().lower()
+        auditpol_ok      = auditpol_raw == "enabled"
+        auditpol_unknown = auditpol_raw == "unknown"
+
+        is_enabled  = log_info.get("IsEnabled")   # None = error, True/False = real value
+        read_error  = bool(log_info.get("ReadError", True))
+
         return {
-            "failed_logins_24h":     failed_24h,
-            "failed_logins_1h":      failed_1h,
-            "lockouts_24h":          lockouts,
-            "users_created_24h":     created,
-            "priv_logons_24h":       priv,
-            "offhours_logons_24h":   offhours,
-            "remote_logons_24h":     remote,
+            "failed_logins_24h":      failed_24h,
+            "failed_logins_1h":       failed_1h,
+            "lockouts_24h":           lockouts,
+            "users_created_24h":      created,
+            "priv_logons_24h":        priv,
+            "offhours_logons_24h":    offhours,
+            "remote_logons_24h":      remote,
             "unique_failed_accounts": unique_targets,
-            "security_log_enabled":  bool(log_info.get("IsEnabled", True)),
-            "security_log_max_mb":   int(log_info.get("MaxSizeMB", 0) or 0),
+            "security_log_enabled":   is_enabled,
+            "security_log_read_error": read_error,
+            "security_log_max_mb":    int(log_info.get("MaxSizeMB", 0) or 0),
+            "eventlog_svc_running":   eventlog_svc_running,
+            "auditpol_ok":            auditpol_ok,
+            "auditpol_unknown":       auditpol_unknown,
         }
 
     # =========================
@@ -455,21 +504,35 @@ class WindowsScanner:
     # 🔒 BITLOCKER
     # =========================
     def collect_bitlocker(self):
-        import csv, io
+        import json
         raw = self.run_powershell(
-            "try { Get-BitLockerVolume | "
-            "Select MountPoint,ProtectionStatus,EncryptionMethod,VolumeStatus "
-            "| ConvertTo-Csv -NoTypeInformation } catch { '' }"
+            "try { "
+            "  Get-BitLockerVolume | ForEach-Object { "
+            "    $protectors = ($_.KeyProtector | ForEach-Object { $_.KeyProtectorType }) -join ','; "
+            "    @{ "
+            "      Mount=$_.MountPoint; "
+            "      ProtectionStatus=$_.ProtectionStatus.ToString(); "
+            "      VolumeStatus=$_.VolumeStatus.ToString(); "
+            "      EncryptionPercentage=$_.EncryptionPercentage; "
+            "      EncryptionMethod=$_.EncryptionMethod.ToString(); "
+            "      KeyProtectors=$protectors "
+            "    } "
+            "  } | ConvertTo-Json -Depth 2 "
+            "} catch { '[]' }"
         )
         volumes = []
         try:
-            reader = csv.DictReader(io.StringIO(raw))
-            for row in reader:
+            data = json.loads(raw.strip()) if raw.strip() else []
+            if isinstance(data, dict):
+                data = [data]
+            for v in data:
                 volumes.append({
-                    "mount":      (row.get("MountPoint")      or "").strip(),
-                    "status":     (row.get("ProtectionStatus") or "").strip(),
-                    "method":     (row.get("EncryptionMethod") or "").strip(),
-                    "vol_status": (row.get("VolumeStatus")    or "").strip(),
+                    "mount":       (v.get("Mount")               or "").strip(),
+                    "status":      str(v.get("ProtectionStatus") or "").strip(),
+                    "vol_status":  str(v.get("VolumeStatus")     or "").strip(),
+                    "pct":         int(v.get("EncryptionPercentage") or 0),
+                    "method":      str(v.get("EncryptionMethod") or "").strip(),
+                    "protectors":  str(v.get("KeyProtectors")    or "").strip(),
                 })
         except Exception:
             pass
@@ -508,10 +571,15 @@ class WindowsScanner:
     # 🦠 SUSPICIOUS PROCESSES
     # =========================
     def collect_suspicious_processes(self):
-        import csv, io
+        import csv, io, os, sys
+        own_name = os.path.splitext(os.path.basename(sys.executable))[0]
         ps = (
             "Get-Process | Where-Object { "
-            "  $_.Path -and ("
+            "  $_.Path -and "
+            f"  $_.Name -ne '{own_name}' -and "
+            "  $_.Path -notlike '*.venv\\*' -and "
+            "  $_.Path -notlike '*\\Python*\\Scripts\\*' -and "
+            "  ("
             "    $_.Path -like '*\\AppData\\Local\\Temp\\*' -or "
             "    $_.Path -like '*\\AppData\\Roaming\\*' -or "
             "    $_.Path -like '*\\Downloads\\*' -or "
@@ -553,7 +621,7 @@ class WindowsScanner:
             "    Snippet=(($_.Message -split \"`n\")[0..1] -join ' ').Substring(0,[math]::Min(200,($_.Message).Length))} "
             "}; "
             "@{Count=($hits|Measure-Object).Count;Enabled=$true;Samples=$samples} | ConvertTo-Json -Depth 3 "
-            "} catch { '{\"Count\":0,\"Enabled\":false,\"Samples\":[]}' }"
+            "} catch { '{\"Count\":0,\"Enabled\":false,\"ReadError\":true,\"Samples\":[]}' }"
         )
         raw = self.run_powershell(ps)
         try:
@@ -614,17 +682,33 @@ class WindowsScanner:
     # 🔥 FIREWALL
     # =========================
     def collect_firewall(self):
-        raw = self.run_powershell(
-            "Get-NetFirewallRule -Enabled True -Direction Inbound -Action Block | "
-            "Get-NetFirewallPortFilter | Select LocalPort,Protocol | ConvertTo-Csv -NoTypeInformation"
+        # Estado de perfiles (Domain, Private, Public)
+        profiles_raw = self.run_powershell(
+            "try { "
+            "Get-NetFirewallProfile | Select Name,Enabled | ConvertTo-Csv -NoTypeInformation"
+            " } catch { '' }"
         )
-        blocked_ports = set()
-        lines = [l.strip() for l in raw.splitlines() if l.strip()]
-        for line in lines[1:]:
+        profiles = []
+        for line in [l.strip() for l in profiles_raw.splitlines() if l.strip()][1:]:
             parts = [p.strip('"') for p in line.split(",")]
-            if len(parts) >= 1:
-                blocked_ports.add(parts[0])
-        return blocked_ports
+            if len(parts) >= 2:
+                profiles.append({"name": parts[0], "enabled": parts[1].lower() == "true"})
+
+        # Puertos con regla ALLOW inbound explícita (los que firewall deja pasar)
+        allowed_raw = self.run_powershell(
+            "try { "
+            "Get-NetFirewallRule -Enabled True -Direction Inbound -Action Allow "
+            "| Get-NetFirewallPortFilter "
+            "| Where-Object { $_.LocalPort -match '^\\d+$' } "
+            "| Select-Object -ExpandProperty LocalPort "
+            "} catch { '' }"
+        )
+        allowed_ports = {p.strip() for p in allowed_raw.splitlines() if p.strip().isdigit()}
+
+        return {
+            "profiles":             profiles,
+            "allowed_inbound_ports": list(allowed_ports),
+        }
 
     # =========================
     # 🛡️ UAC

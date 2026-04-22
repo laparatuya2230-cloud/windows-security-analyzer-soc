@@ -224,26 +224,85 @@ def _build_executive_summary(findings, score):
         status_bg    = "#08251a"
         status_icon  = "✅"
 
-    # Impacto general
+    # Impacto general — evaluado por hallazgo individual para evitar falsos positivos cruzados
+    def _has(sev_list, *keywords):
+        """True si algún hallazgo de las severidades dadas contiene todas las keywords."""
+        return any(
+            all(kw in f["title"].lower() for kw in keywords)
+            for f in findings if f["severity"] in sev_list
+        )
+
+    critical_high = {"critical", "high"}
+    any_confirmed = {"critical", "high", "medium", "low"}
+
     impact_parts = []
-    titles_low = " ".join(f["title"].lower() for f in findings)
-    if "deshabilitado" in titles_low and "logging" in titles_low:
-        impact_parts.append("Los eventos de seguridad no están siendo auditados.")
-    if "defender" in titles_low and ("deshabilitado" in titles_low or "desactivad" in titles_low):
+
+    # Visibilidad / auditoría (mayor prioridad)
+    if _has(critical_high, "registro de seguridad") or _has(critical_high, "auditoria", "ciega"):
+        impact_parts.append("El sistema no está registrando eventos de seguridad: cualquier ataque quedaría sin evidencia forense.")
+    elif _has(any_confirmed, "logging", "deshabilitado") or _has(any_confirmed, "script block logging"):
+        impact_parts.append("La visibilidad sobre actividad PowerShell es limitada.")
+
+    # Antimalware — solo si hay hallazgo específico de Defender deshabilitado
+    if _has(critical_high, "defender", "deshabilitado") or _has(critical_high, "defender", "desactivad"):
         impact_parts.append("El sistema carece de protección antimalware activa.")
-    if "wdigest" in titles_low:
-        impact_parts.append("Las credenciales pueden ser volcadas desde la memoria.")
-    if "fuerza bruta" in titles_low or "brute" in titles_low:
+
+    # Credenciales en memoria
+    if _has(any_confirmed, "wdigest"):
+        impact_parts.append("Las credenciales pueden ser extraídas desde la memoria.")
+
+    # Ataque activo
+    if _has(critical_high, "fuerza bruta") or _has(critical_high, "brute"):
         impact_parts.append("Se detecta actividad de fuerza bruta en curso.")
-    if "rdp" in titles_low and "nla" in titles_low:
+
+    # Exposición de red — RDP sin NLA
+    if _has(any_confirmed, "rdp") and _has(any_confirmed, "nla"):
         impact_parts.append("El servicio RDP está expuesto sin autenticación de red.")
-    if not impact_parts:
-        impact_parts.append("Se detectaron configuraciones que elevan el riesgo del sistema.")
+
+    # SMB null sessions
+    if _has(any_confirmed, "smb", "null") or _has(any_confirmed, "sesiones nulas"):
+        impact_parts.append("Las sesiones nulas SMB permiten enumeración anónima de usuarios y recursos de red.")
+
+    # Puertos expuestos
+    exposed_ports = [f for f in findings
+                     if f["severity"] in any_confirmed and
+                     any(kw in f["title"].lower() for kw in ("puerto", "port", "expuesto", "escucha"))]
+    if exposed_ports:
+        port_names = []
+        for f in exposed_ports[:3]:
+            t = f["title"].lower()
+            for svc in ("rdp", "smb", "winrm", "rpc", "ftp", "telnet"):
+                if svc in t:
+                    port_names.append(svc.upper())
+                    break
+        if port_names:
+            impact_parts.append(f"Puertos sensibles expuestos en red: {', '.join(dict.fromkeys(port_names))}.")
+
+    # Política de contraseñas
+    if _has(any_confirmed, "contrasena", "debil") or _has(any_confirmed, "longitud minima"):
+        impact_parts.append("La política de contraseñas no ofrece protección adecuada frente a ataques de fuerza bruta.")
+
+    # Fallback — basado en conteo real, no texto genérico
+    criticals = [f for f in findings if f["severity"] == "critical"]
+    highs     = [f for f in findings if f["severity"] == "high"]
+    if not impact_parts and criticals:
+        titles = "; ".join(f["title"] for f in criticals[:2])
+        impact_parts.append(f"{len(criticals)} hallazgo(s) crítico(s) detectado(s): {titles}.")
+    elif not impact_parts and highs:
+        titles = "; ".join(f["title"] for f in highs[:2])
+        impact_parts.append(f"{len(highs)} hallazgo(s) de riesgo alto: {titles}.")
+    elif not impact_parts and any(f["severity"] in any_confirmed for f in findings):
+        med_count = sum(1 for f in findings if f["severity"] == "medium")
+        impact_parts.append(f"{med_count} configuraciones de riesgo medio requieren revisión.")
+    elif not impact_parts:
+        impact_parts.append("No se detectaron vulnerabilidades confirmadas en este escaneo.")
 
     impact_text = " ".join(impact_parts)
 
-    # Top 5
-    top5 = findings[:5]
+    # Top 5 — prioriza confirmados; incluye REVIEW solo si no hay suficientes confirmados
+    confirmed_f = [f for f in findings if f["severity"] not in ("review", "info")]
+    top5 = (confirmed_f[:5] if len(confirmed_f) >= 5
+            else confirmed_f + [f for f in findings if f["severity"] == "review"][:5 - len(confirmed_f)])
     top5_html = "".join(
         f'<li style="margin:4px 0;color:{SEV_COLOR.get(f["severity"],"#aaa")};">'
         f'<b>[{f["severity"].upper()}]</b> <span style="color:#e8f4ff">{f["title"]}</span></li>'
@@ -335,15 +394,19 @@ def export_html(findings, score, system_info=None, output_path=None, comparison=
         color = SEV_COLOR.get(sev, "#aaa")
         bg    = SEV_BG.get(sev, "#1a1a1a")
         mitre = ", ".join(f.get("mitre", [])) or "—"
+        is_review = sev == "review"
+        badge = (
+            f'<span style="border:1px solid {color};color:{color};background:transparent;'
+            f'padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;">REVIEW</span>'
+            if is_review else
+            f'<span style="background:{color};color:#000;padding:2px 8px;'
+            f'border-radius:4px;font-size:11px;font-weight:700;">{sev.upper()}</span>'
+        )
+        title_style = "color:#9ab8d8;font-style:italic;" if is_review else "color:#e8f4ff;font-weight:600;"
         rows_html += f"""
         <tr style="background:{bg}; border-bottom:1px solid #1a3a5c;">
-          <td style="padding:10px 14px;">
-            <span style="background:{color};color:#000;padding:2px 8px;
-                  border-radius:4px;font-size:11px;font-weight:700;">
-              {sev.upper()}
-            </span>
-          </td>
-          <td style="padding:10px 14px;color:#e8f4ff;font-weight:600;">{f['title']}</td>
+          <td style="padding:10px 14px;">{badge}</td>
+          <td style="padding:10px 14px;{title_style}">{f['title']}</td>
           <td style="padding:10px 14px;color:#6a90b8;font-size:12px;word-break:break-all;">{f['details']}</td>
           <td style="padding:10px 14px;color:#10d48e;font-size:12px;">{f['recommendation']}</td>
           <td style="padding:10px 14px;color:#00d4ff;font-size:11px;">{mitre}</td>

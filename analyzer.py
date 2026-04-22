@@ -45,24 +45,22 @@ class SecurityAnalyzer:
     # Ports
     def analyze_ports(self, results):
         findings = []
-        firewall = results.get("firewall", {})
-        if isinstance(firewall, dict):
-            blocked_ports = firewall.get("blocked_ports", set()) or set()
-        else:
-            blocked_ports = firewall or set()
+        firewall = results.get("firewall", {}) or {}
+        allowed_ports  = set(firewall.get("allowed_inbound_ports", []) or [])
+        fw_profiles    = firewall.get("profiles", []) or []
+        firewall_on    = any(p.get("enabled", True) for p in fw_profiles) if fw_profiles else True
 
         ports = results.get("network", {}).get("listening_ports", []) or []
 
         high_risk_ports = {
-            "21": "FTP",
-            "23": "Telnet",
-            "445": "SMB",
+            "21":   "FTP",
+            "23":   "Telnet",
+            "445":  "SMB",
             "3389": "RDP",
-            "139": "NetBIOS",
-            "135": "RPC",
+            "139":  "NetBIOS",
+            "135":  "RPC",
             "5900": "VNC",
         }
-        safe_system_ports = {"135"}
         seen_ports = set()
 
         for line in ports:
@@ -74,57 +72,61 @@ class SecurityAnalyzer:
                 continue
             seen_ports.add(port)
 
-            name = high_risk_ports[port]
+            name  = high_risk_ports[port]
             mitre = MITRE_MAP.get(name, ["T1046 - Network Service Discovery"])
             exposed_to_all = (
                 f"0.0.0.0:{port}" in line
                 or f"[::]:{port}" in line
                 or f"*:{port}" in line
             )
-            is_protected = port in blocked_ports or "Any" in blocked_ports
 
+            # Protocolos inseguros — siempre crítico independientemente del firewall
             if name in ("FTP", "Telnet"):
-                findings.append(
-                    self.build(
-                        "critical",
-                        f"Protocolo inseguro activo: {name} (puerto {port})",
-                        line,
-                        f"Deshabilitar {name} y usar alternativas seguras como SSH/SFTP.",
-                        ["T1021 - Remote Services"],
-                    )
-                )
+                findings.append(self.build(
+                    "critical",
+                    f"Protocolo inseguro activo: {name} (puerto {port})",
+                    f"Puerto {port} en escucha. {line.strip()}",
+                    f"Deshabilitar {name} y usar alternativas seguras (SSH/SFTP).",
+                    ["T1021 - Remote Services"],
+                ))
                 continue
 
-            if port in safe_system_ports:
-                findings.append(
-                    self.build(
-                        "medium",
-                        f"Puerto del sistema expuesto: {name} ({port})",
-                        line,
-                        "Restringir acceso remoto solo a redes y hosts autorizados.",
-                        mitre,
-                    )
-                )
-                continue
+            # Determinar exposición real considerando firewall
+            fw_allows    = port in allowed_ports
+            fw_protected = firewall_on and not fw_allows  # firewall ON y sin regla ALLOW → bloqueado
 
-            if name == "SMB" and exposed_to_all and not is_protected:
-                severity = "critical"
-            elif name == "RDP" and exposed_to_all and not is_protected:
-                severity = "high"
-            elif exposed_to_all and not is_protected:
-                severity = "high"
-            else:
-                severity = "medium"
-
-            findings.append(
-                self.build(
-                    severity,
-                    f"Puerto sensible en escucha: {name} ({port})",
-                    line,
-                    "Confirmar necesidad del servicio y limitar la exposicion.",
+            if fw_protected:
+                # Puerto activo pero bloqueado por firewall — riesgo bajo
+                findings.append(self.build(
+                    "low",
+                    f"Puerto {name} ({port}) activo pero bloqueado por firewall",
+                    f"El servicio {name} está en escucha localmente pero el firewall no tiene regla "
+                    f"ALLOW inbound para el puerto {port}.",
+                    f"Verificar que el servicio {name} sea necesario. Si no, deshabilitarlo.",
                     mitre,
-                )
-            )
+                ))
+            elif exposed_to_all and not firewall_on:
+                # Sin firewall + expuesto → alta severidad
+                sev = "critical" if name == "SMB" else "high"
+                findings.append(self.build(
+                    sev,
+                    f"Puerto {name} ({port}) expuesto a red sin protección de firewall",
+                    f"El servicio {name} acepta conexiones desde cualquier dirección y el firewall "
+                    f"no está activo. Riesgo de acceso remoto no autorizado.",
+                    f"Activar el firewall de Windows y restringir el puerto {port} a hosts autorizados.",
+                    mitre,
+                ))
+            else:
+                # Firewall ON + regla ALLOW → puerto realmente accesible
+                sev = "high" if name in ("SMB", "RDP") else "medium"
+                findings.append(self.build(
+                    sev,
+                    f"Puerto {name} ({port}) expuesto con regla ALLOW en firewall",
+                    f"El puerto {port} ({name}) tiene una regla de entrada explícita que permite "
+                    f"conexiones entrantes.",
+                    f"Restringir la regla de firewall del puerto {port} a IPs o subredes autorizadas.",
+                    mitre,
+                ))
 
         return findings
 
@@ -222,21 +224,9 @@ class SecurityAnalyzer:
         if not policy:
             return findings
 
-        min_length = int(policy.get("min_length", 0) or 0)
         max_age = int(policy.get("max_age", 0) or 0)
         lockout_threshold = int(policy.get("lockout_threshold", 0) or 0)
         history = int(policy.get("history", 0) or 0)
-
-        if min_length < 8:
-            findings.append(
-                self.build(
-                    "high",
-                    f"Politica de contrasena debil: longitud minima {min_length}",
-                    f"Se detecto una longitud minima de {min_length}.",
-                    "Configurar longitud minima de 8 a 12 caracteres.",
-                    ["T1110 - Brute Force"],
-                )
-            )
 
         if max_age == 0 or max_age > 90:
             findings.append(
@@ -295,10 +285,14 @@ class SecurityAnalyzer:
             findings.append(
                 self.build(
                     "high",
-                    "Sesiones nulas SMB no restringidas",
-                    "RestrictNullSessAccess = False",
-                    "Restringir sesiones nulas SMB.",
-                    ["T1135 - Network Share Discovery"],
+                    "SMB: sesiones nulas sin restricción (RestrictNullSessAccess = 0)",
+                    "Cualquier usuario anónimo puede conectarse a recursos compartidos IPC$ sin "
+                    "credenciales, permitiendo enumeración de usuarios, grupos y políticas del dominio.",
+                    "Establecer RestrictNullSessAccess = 1: "
+                    "Set-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters' "
+                    "-Name RestrictNullSessAccess -Value 1. "
+                    "Si SMB no es necesario en red, bloquearlo en el firewall (puerto 445).",
+                    ["T1135 - Network Share Discovery", "T1087 - Account Discovery"],
                 )
             )
 
@@ -576,10 +570,12 @@ class SecurityAnalyzer:
         if enable_lua == 0:
             findings.append(self.build(
                 "critical",
-                "UAC completamente deshabilitado (EnableLUA=0)",
-                "El Control de Cuentas de Usuario esta desactivado. Cualquier proceso puede "
-                "obtener privilegios de administrador sin ningun aviso.",
-                "Habilitar UAC: HKLM\\...\\Policies\\System -> EnableLUA = 1",
+                "UAC deshabilitado: escalada de privilegios sin restriccion (EnableLUA=0)",
+                "El Control de Cuentas de Usuario esta completamente desactivado. Cualquier proceso "
+                "en ejecucion puede adquirir privilegios de SYSTEM sin ninguna interaccion del usuario, "
+                "eliminando la barrera de separacion entre sesiones de usuario y administrador.",
+                "Habilitar UAC via GPO o registro: HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion"
+                "\\Policies\\System -> EnableLUA = 1. Requiere reinicio.",
                 ["T1548.002 - Bypass User Account Control"],
             ))
             return findings  # sin UAC el resto no aplica
@@ -587,19 +583,21 @@ class SecurityAnalyzer:
         if consent_admin == 0:
             findings.append(self.build(
                 "high",
-                "UAC: elevacion silenciosa sin solicitud de credenciales (Admin)",
-                "ConsentPromptBehaviorAdmin=0. Los administradores obtienen privilegios "
-                "elevados sin ningun prompt, facilitando escalada de privilegios.",
-                "Configurar ConsentPromptBehaviorAdmin a 1 (pedir credenciales) o 2 (pedir consentimiento).",
+                "UAC: elevacion automatica sin confirmacion para administradores (ConsentPromptBehaviorAdmin=0)",
+                "Los procesos ejecutados por cuentas administrativas obtienen tokens elevados de forma "
+                "silenciosa. Un malware con contexto de administrador escala a SYSTEM sin friction.",
+                "Establecer ConsentPromptBehaviorAdmin=1 (solicitar credenciales en escritorio seguro) "
+                "o al menos =2 (solicitar consentimiento). Valor 0 solo es aceptable en entornos kiosko.",
                 ["T1548.002 - Bypass User Account Control"],
             ))
         elif consent_admin in (2, 4, 5):
             findings.append(self.build(
                 "medium",
-                "UAC: solo solicita confirmacion, no credenciales (Admin)",
-                f"ConsentPromptBehaviorAdmin={consent_admin}. El administrador solo hace "
-                "clic en 'Si' sin introducir contrasena, lo que reduce la proteccion.",
-                "Configurar ConsentPromptBehaviorAdmin=1 para exigir credenciales completas.",
+                f"UAC: prompt de confirmacion sin credenciales para administradores (ConsentPromptBehaviorAdmin={consent_admin})",
+                f"ConsentPromptBehaviorAdmin={consent_admin}: el administrador aprueba la elevacion "
+                "con un clic en 'Si', sin necesidad de introducir contrasena. Esto no verifica la "
+                "identidad del usuario y es vulnerable a ataques de clickjacking si el escritorio seguro esta desactivado.",
+                "Configurar ConsentPromptBehaviorAdmin=1 para exigir autenticacion completa en cada elevacion.",
                 ["T1548.002 - Bypass User Account Control"],
             ))
         # consent_admin in (1, 3) → pide credenciales → configuracion segura, no se reporta
@@ -607,18 +605,23 @@ class SecurityAnalyzer:
         if consent_user == 0:
             findings.append(self.build(
                 "high",
-                "UAC: usuarios estandar elevan sin solicitud (ConsentPromptBehaviorUser=0)",
-                "Los usuarios no-administradores pueden elevar privilegios sin credenciales.",
-                "Configurar ConsentPromptBehaviorUser=3 (solicitar credenciales de administrador).",
+                "UAC: usuarios estandar pueden elevar privilegios sin credenciales (ConsentPromptBehaviorUser=0)",
+                "ConsentPromptBehaviorUser=0: las cuentas sin privilegios administrativos obtienen "
+                "elevacion sin presentar credenciales de administrador, anulando el modelo de minimo privilegio.",
+                "Establecer ConsentPromptBehaviorUser=3 para requerir credenciales de administrador "
+                "en cada solicitud de elevacion desde cuentas estandar.",
                 ["T1548.002 - Bypass User Account Control"],
             ))
 
         if secure_desktop == 0:
             findings.append(self.build(
                 "medium",
-                "UAC: escritorio seguro deshabilitado (PromptOnSecureDesktop=0)",
-                "El prompt de UAC no usa escritorio seguro, vulnerable a ataques de UI spoofing.",
-                "Habilitar PromptOnSecureDesktop=1 para mostrar el dialogo UAC en escritorio aislado.",
+                "UAC: prompt de elevacion expuesto fuera del escritorio seguro (PromptOnSecureDesktop=0)",
+                "El dialogo UAC se muestra en el escritorio interactivo del usuario en lugar del "
+                "escritorio seguro aislado. Esto permite ataques de UI spoofing donde un proceso "
+                "malicioso simula el prompt para capturar la aprobacion del usuario.",
+                "Habilitar PromptOnSecureDesktop=1 en HKLM\\SOFTWARE\\Microsoft\\Windows\\"
+                "CurrentVersion\\Policies\\System para aislar el dialogo UAC del resto de procesos.",
                 ["T1548.002 - Bypass User Account Control"],
             ))
 
@@ -639,21 +642,49 @@ class SecurityAnalyzer:
         offhours    = int(ev.get("offhours_logons_24h",   0) or 0)
         remote      = int(ev.get("remote_logons_24h",     0) or 0)
         targets     = ev.get("unique_failed_accounts",    []) or []
-        log_ok      = bool(ev.get("security_log_enabled", True))
-        log_mb      = int(ev.get("security_log_max_mb",   0) or 0)
+        log_enabled  = ev.get("security_log_enabled")   # None=error, True/False=real
+        read_error   = bool(ev.get("security_log_read_error", True))
+        log_mb       = int(ev.get("security_log_max_mb",   0) or 0)
+        svc_running  = ev.get("eventlog_svc_running", True)
+        auditpol_ok      = ev.get("auditpol_ok", True)
+        auditpol_unknown = ev.get("auditpol_unknown", False)
 
-        # Estado del registro
-        if not log_ok:
+        # Estado del registro — solo CRITICAL si hay evidencia real de que está deshabilitado
+        if svc_running is False:
+            findings.append(self.build("critical",
+                "Servicio Windows Event Log detenido",
+                "El servicio EventLog no está en ejecución — ningún evento del sistema se registra.",
+                "Iniciar el servicio: Start-Service EventLog y configurar inicio automático.",
+                ["T1562.002 - Disable Windows Event Logging"]))
+        elif log_enabled is False and not read_error:
             findings.append(self.build("critical",
                 "Registro de seguridad de Windows deshabilitado",
-                "Security Event Log inactivo — sin auditoria de eventos.",
+                "El canal Security Event Log está desactivado — sin auditoría de eventos de autenticación.",
                 "auditpol /set /category:* /success:enable /failure:enable",
                 ["T1562.002 - Disable Windows Event Logging"]))
-        elif log_mb < 20:
+        elif auditpol_unknown:
+            findings.append(self.build("review",
+                "Auditoría (auditpol): no se pudo verificar el estado",
+                "No se pudo leer la configuración de auditpol para Logon/Logoff/Special Logon.",
+                "Verificar manualmente: auditpol /get /category:* como Administrador.",
+                ["T1562.002 - Disable Windows Event Logging"]))
+        elif not auditpol_ok:
+            findings.append(self.build("high",
+                "Auditoría de eventos de seguridad deshabilitada (auditpol)",
+                "Las subcategorías Logon, Logoff y Special Logon no registran eventos de autenticación.",
+                "Ejecutar: auditpol /set /subcategory:'Logon' /success:enable /failure:enable",
+                ["T1562.002 - Disable Windows Event Logging"]))
+        elif read_error:
+            findings.append(self.build("review",
+                "Registro de seguridad: no se pudo verificar el estado",
+                "No se pudo leer la configuración del Security Event Log (posible falta de permisos).",
+                "Verificar con: Get-WinEvent -ListLog Security y auditpol /get /category:* como Admin.",
+                ["T1562.002 - Disable Windows Event Logging"]))
+        elif log_mb > 0 and log_mb < 20:
             findings.append(self.build("medium",
                 f"Registro de seguridad muy pequeño ({log_mb} MB)",
-                "Se sobreescribe rapidamente, perdiendo evidencia forense.",
-                "Aumentar tamanio del Security Log a 128 MB o mas.",
+                "El tamaño máximo del log es insuficiente y se sobreescribe rápidamente, perdiendo evidencia forense.",
+                "Aumentar el tamaño del Security Log a 128 MB o más en el Visor de Eventos.",
                 ["T1562.002 - Disable Windows Event Logging"]))
 
         # Brute force — ventana corta (1h) es indicador más preciso de ataque activo
@@ -755,21 +786,49 @@ class SecurityAnalyzer:
         findings = []
         volumes = results.get("bitlocker", []) or []
         if not volumes:
-            findings.append(self.build("high",
-                "BitLocker no disponible o sin informacion",
-                "No se pudo obtener el estado de cifrado de disco.",
-                "Verificar que BitLocker este disponible y activarlo.",
+            findings.append(self.build("review",
+                "BitLocker: no se pudo leer el estado de cifrado",
+                "No se pudo obtener informacion de BitLocker (permisos insuficientes o modulo no disponible).",
+                "Verificar manualmente con: Get-BitLockerVolume en PowerShell como Admin.",
                 ["T1025 - Data from Removable Media"]))
             return findings
+
         for vol in volumes:
-            status = (vol.get("status") or "").strip()
-            mount  = vol.get("mount", "?")
-            if status in ("0", "Off", "ProtectionOff"):
+            mount      = vol.get("mount", "?")
+            status     = (vol.get("status")     or "").strip()
+            vol_status = (vol.get("vol_status") or "").strip()
+            pct        = int(vol.get("pct", 0) or 0)
+            protectors = (vol.get("protectors") or "").strip()
+
+            # El cifrado real se determina por VolumeStatus + porcentaje, no solo ProtectionStatus
+            fully_enc    = vol_status == "FullyEncrypted" or pct >= 100
+            fully_dec    = vol_status == "FullyDecrypted" or pct == 0
+            prot_info    = f"Protectores: {protectors}." if protectors else ""
+
+            if fully_enc:
+                # Cifrado completo → seguro independientemente de ProtectionStatus
+                continue
+
+            if fully_dec:
                 findings.append(self.build("high",
                     f"BitLocker desactivado en {mount}",
-                    f"Unidad {mount} sin cifrado de disco activo.",
-                    "Activar BitLocker en esta unidad.",
+                    f"La unidad {mount} no tiene cifrado activo (VolumeStatus={vol_status}, {pct}%). {prot_info}",
+                    f"Activar BitLocker: Enable-BitLocker -MountPoint '{mount}' "
+                    "-EncryptionMethod XtsAes256 -TpmProtector",
                     ["T1025 - Data from Removable Media"]))
+            elif 0 < pct < 100:
+                findings.append(self.build("medium",
+                    f"BitLocker en progreso en {mount}: {pct}% cifrado",
+                    f"La unidad {mount} está cifrándose (VolumeStatus={vol_status}). {prot_info}",
+                    "Esperar a que el cifrado complete o verificar que no esté pausado.",
+                    ["T1025 - Data from Removable Media"]))
+            else:
+                findings.append(self.build("review",
+                    f"BitLocker en {mount}: estado indeterminado",
+                    f"VolumeStatus={vol_status}, ProtectionStatus={status}, {pct}% cifrado. {prot_info}",
+                    "Verificar manualmente: Get-BitLockerVolume como Admin.",
+                    ["T1025 - Data from Removable Media"]))
+
         return findings
 
     # Correlación y alertas comportamentales
@@ -792,8 +851,12 @@ class SecurityAnalyzer:
         admins      = users.get("admins", []) or []
         no_pw       = len(users.get("users_without_password", []) or [])
         pending     = int(upd.get("pending_count", 0) or 0)
-        log_ok      = bool(ev.get("security_log_enabled", True))
-        ps_enabled  = bool(ps.get("Enabled", True))
+        _log_enabled  = ev.get("security_log_enabled")
+        _log_err      = bool(ev.get("security_log_read_error", True))
+        _svc_running  = ev.get("eventlog_svc_running", True)
+        log_ok        = (_log_enabled is True) or (_log_err and _svc_running is not False)
+        ps_enabled    = bool(ps.get("Enabled", True))
+        ps_read_err   = bool(ps.get("ReadError", False))
         auto_on     = str(al.get("AutoAdminLogon", "0")).strip() == "1"
         bl_off      = any((v.get("status") or "").strip() in ("0", "Off", "ProtectionOff") for v in bl)
         svc_on      = bool(dv.get("service_enabled", True))
@@ -810,7 +873,7 @@ class SecurityAnalyzer:
                 "Implementar lockout threshold inmediatamente.",
                 ["T1110 - Brute Force"]))
 
-        if not log_ok and not ps_enabled:
+        if not log_ok and not ps_enabled and not ps_read_err:
             alerts.append(self.build("critical",
                 "[CORRELACION] Auditoria ciega: Security Log + PowerShell Log deshabilitados",
                 "Sin logs de seguridad ni PowerShell, cualquier ataque queda sin evidencia forense.",
@@ -954,11 +1017,18 @@ class SecurityAnalyzer:
             return findings
 
         if not ps.get("Enabled", True):
-            findings.append(self.build("medium",
-                "PowerShell Script Block Logging no disponible",
-                "No se pudieron leer logs de Microsoft-Windows-PowerShell/Operational.",
-                "Habilitar Script Block Logging via GPO: Administrative Templates > Windows PowerShell.",
-                ["T1059.001 - PowerShell"]))
+            if ps.get("ReadError", False):
+                findings.append(self.build("review",
+                    "PowerShell Script Block Logging: sin acceso al log",
+                    "No se pudo leer Microsoft-Windows-PowerShell/Operational (permisos o log no configurado).",
+                    "Ejecutar como Admin y habilitar Script Block Logging via GPO si no esta activo.",
+                    ["T1059.001 - PowerShell"]))
+            else:
+                findings.append(self.build("medium",
+                    "PowerShell Script Block Logging deshabilitado",
+                    "No se pudieron leer logs de Microsoft-Windows-PowerShell/Operational.",
+                    "Habilitar Script Block Logging via GPO: Administrative Templates > Windows PowerShell.",
+                    ["T1059.001 - PowerShell"]))
             return findings
 
         count   = int(ps.get("Count", 0) or 0)
@@ -1064,8 +1134,8 @@ class SecurityAnalyzer:
         findings.sort(key=lambda f: _order.get(f.get("severity", "info"), 5))
 
         # Dynamic scoring — logarithmic, based on real impact weight
-        _w = {"critical": 25, "high": 15, "medium": 7, "low": 3, "review": 1}
-        raw = sum(_w.get(f.get("severity", "info"), 1) for f in findings)
-        score = min(100, int(100 * (1 - math.exp(-raw / 40)))) if raw > 0 else 0
+        _w = {"critical": 20, "high": 10, "medium": 3, "low": 1, "review": 0}
+        raw = sum(_w.get(f.get("severity", "info"), 0) for f in findings)
+        score = min(100, int(100 * (1 - math.exp(-raw / 60)))) if raw > 0 else 0
 
         return findings, score
