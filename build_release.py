@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 
 DIST_DIR    = Path("dist/WinVulnScanner")
-OUTPUT_ZIP  = Path("WinVulnScanner-v2.1.zip")
+OUTPUT_ZIP  = Path("WinVulnScanner-v1.0.zip")
 
 # Archivos y extensiones que nunca deben incluirse en el ZIP
 EXCLUDE_FILES = {

@@ -1,4 +1,4 @@
-# Windows Vuln Scanner v2.1 PRO
+# Windows Vuln Scanner v1.0
 
 > Herramienta de auditoría de seguridad para Windows. Escanea el sistema en busca de vulnerabilidades, malas configuraciones y amenazas activas, genera reportes HTML/JSON/TXT y compara la evolución de seguridad entre escaneos.
 
@@ -8,7 +8,7 @@
 
 ## Descarga rápida
 
-**[⬇ Descargar Portable v2.0.1](https://github.com/laparatuya2230-cloud/windows-security-analyzer-soc/releases/tag/v2.0.1)**
+**[⬇ Descargar Portable v1.0](https://github.com/laparatuya2230-cloud/windows-security-analyzer-soc/releases/tag/v1.0)**
 
 Descomprime el ZIP y ejecuta `WinVulnScanner.exe` como **Administrador**.
 
