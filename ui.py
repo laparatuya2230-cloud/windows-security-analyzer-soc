@@ -1,5 +1,5 @@
 """
-ui.py  —  Windows Vuln Scanner v2.0 PRO
+ui.py  —  Windows Vuln Scanner v1.0
 Interfaz SOC con: chart, historial, remediation, notificaciones, dark/light, escaneo programado.
 """
 import json
@@ -20,7 +20,7 @@ from report_exporter import export_html, export_json, export_txt, compare_scans
 from scanner import WindowsScanner
 
 APP_NAME    = "Windows Vuln Scanner"
-APP_VERSION = "v2.0 PRO"
+APP_VERSION = "v1.0"
 HISTORY_FILE = Path("scan_history.json")
 
 # ─────────────────────────────────────────────
@@ -144,29 +144,164 @@ class SeverityChart(tk.Canvas):
 
 class FindingRow(tk.Frame):
     def __init__(self, parent, finding, index, t, on_fix=None):
-        bg = t["BG_PANEL"] if index % 2 == 0 else t["BG_CARD"]
-        super().__init__(parent, bg=bg)
+        self._bg_base = t["BG_PANEL"] if index % 2 == 0 else t["BG_CARD"]
+        super().__init__(parent, bg=self._bg_base)
         self.pack(fill="x")
+
+        self._t        = t
+        self._finding  = finding
+        self._expanded = False
+        self._detail   = None
 
         sev   = finding["severity"]
         color = SEV_COLORS.get(sev, t["TEXT_SEC"])
 
-        badge = tk.Label(self, text=f" {sev.upper()} ", bg=color,
-                         fg="#000000", font=("Consolas", 8, "bold"), padx=4)
-        badge.pack(side="left", padx=(10, 8), pady=6)
+        # ── header row ──
+        header = tk.Frame(self, bg=self._bg_base, cursor="hand2")
+        header.pack(fill="x")
 
-        tk.Label(self, text=finding["title"], bg=bg, fg=t["TEXT_PRI"],
-                 font=("Consolas", 10), anchor="w").pack(side="left", pady=6)
+        self._arrow = tk.Label(header, text="▶", bg=self._bg_base, fg=t["TEXT_SEC"],
+                               font=("Consolas", 8), width=2, cursor="hand2")
+        self._arrow.pack(side="left", padx=(6, 0), pady=6)
+
+        badge = tk.Label(header, text=f" {sev.upper()} ", bg=color,
+                         fg="#000000", font=("Consolas", 8, "bold"), padx=4, cursor="hand2")
+        badge.pack(side="left", padx=(4, 8), pady=6)
+
+        title_lbl = tk.Label(header, text=finding["title"], bg=self._bg_base,
+                             fg=t["TEXT_PRI"], font=("Consolas", 10), anchor="w",
+                             cursor="hand2")
+        title_lbl.pack(side="left", pady=6, fill="x", expand=True)
 
         for tag in finding.get("mitre", [])[:1]:
             short = tag.split(" - ")[0]
-            tk.Label(self, text=short, bg=t["BG_HOVER"], fg=t["ACCENT"],
-                     font=("Consolas", 8), padx=6).pack(side="right", padx=(0, 10), pady=6)
+            tk.Label(header, text=short, bg=t["BG_HOVER"], fg=t["ACCENT"],
+                     font=("Consolas", 8), padx=6, cursor="hand2").pack(
+                         side="right", padx=(0, 10), pady=6)
 
-        # Fix button desactivado — reactivar cuando esté listo el módulo de remediación
-        # if on_fix and sev in ("critical", "high", "medium"):
-        #     btn = tk.Button(self, text="Fix ▶", ...)
-        #     btn.pack(side="right", padx=4, pady=4)
+        # bind click on all header elements
+        for w in [header, self._arrow, badge, title_lbl]:
+            w.bind("<Button-1>", self._toggle)
+
+        # hover effect
+        def _enter(_):
+            header.config(bg=t["BG_HOVER"])
+            for child in header.winfo_children():
+                try:
+                    child.config(bg=t["BG_HOVER"])
+                except Exception:
+                    pass
+        def _leave(_):
+            header.config(bg=self._bg_base)
+            for child in header.winfo_children():
+                try:
+                    child.config(bg=self._bg_base)
+                except Exception:
+                    pass
+        for w in [header, self._arrow, badge, title_lbl]:
+            w.bind("<Enter>", _enter)
+            w.bind("<Leave>", _leave)
+
+    def _toggle(self, _event=None):
+        if self._expanded:
+            if self._detail:
+                self._detail.destroy()
+                self._detail = None
+            self._arrow.config(text="▶")
+            self._expanded = False
+        else:
+            self._show_detail()
+            self._arrow.config(text="▼")
+            self._expanded = True
+
+    def _show_detail(self):
+        t = self._t
+        f = self._finding
+        bg = t["BG_CARD"]
+
+        self._detail = tk.Frame(self, bg=bg,
+                                highlightbackground=t["BORDER"],
+                                highlightthickness=1)
+        self._detail.pack(fill="x", padx=(28, 8), pady=(0, 6))
+
+        sev_color = SEV_COLORS.get(f["severity"], t["TEXT_SEC"])
+
+        def _section(title, body, title_color=None):
+            if not body:
+                return
+            tc = title_color or t["ACCENT"]
+            sec = tk.Frame(self._detail, bg=bg)
+            sec.pack(fill="x", padx=12, pady=(8, 2))
+            tk.Label(sec, text=title, bg=bg, fg=tc,
+                     font=("Consolas", 8, "bold")).pack(anchor="w")
+            tk.Label(sec, text=body, bg=bg, fg=t["TEXT_PRI"],
+                     font=("Consolas", 9), wraplength=780,
+                     justify="left", anchor="w").pack(anchor="w", padx=8, pady=(2, 0))
+
+        _section("¿QUÉ ES?",          f.get("explanation", ""), t["ACCENT"])
+        _section("IMPACTO POTENCIAL",  f.get("impact", ""),      "#ff6b35")
+        _section("RECOMENDACIÓN",      f.get("recommendation", ""), "#10d48e")
+        if f.get("details"):
+            _section("DETALLE TÉCNICO", f["details"], t["TEXT_SEC"])
+
+        # separator
+        tk.Frame(self._detail, bg=t["BORDER"], height=1).pack(fill="x", padx=12, pady=(6, 0))
+
+
+# ─────────────────────────────────────────────
+# COMPACT FINDING ROW  (SOC dashboard list)
+# ─────────────────────────────────────────────
+class CompactFindingRow(tk.Frame):
+    ROW_H = 26
+
+    def __init__(self, parent, finding, index, t, on_select=None):
+        self._bg = t["BG_PANEL"] if index % 2 == 0 else t["BG_CARD"]
+        super().__init__(parent, bg=self._bg, height=self.ROW_H, cursor="hand2")
+        self.pack(fill="x")
+        self.pack_propagate(False)
+
+        sev   = finding["severity"]
+        color = SEV_COLORS.get(sev, t["TEXT_SEC"])
+
+        # Left severity stripe
+        tk.Frame(self, bg=color, width=3).pack(side="left", fill="y")
+
+        # Single-letter badge
+        badge = tk.Label(self, text=sev[0].upper(), bg=color, fg="#000",
+                         font=("Consolas", 7, "bold"), width=2, cursor="hand2")
+        badge.pack(side="left", padx=(1, 6))
+
+        # MITRE tag (right side, packed before title so it doesn't get squeezed)
+        for tag in finding.get("mitre", [])[:1]:
+            short = tag.split(" - ")[0]
+            tk.Label(self, text=short, bg=t["BG_HOVER"], fg=t["ACCENT"],
+                     font=("Consolas", 7), padx=4, cursor="hand2").pack(
+                         side="right", padx=(0, 6))
+
+        # Title
+        title_lbl = tk.Label(self, text=finding["title"], bg=self._bg, fg=t["TEXT_PRI"],
+                             font=("Consolas", 9), anchor="w", cursor="hand2")
+        title_lbl.pack(side="left", fill="x", expand=True)
+
+        # Hover + click
+        _hover = t["BG_HOVER"]
+        _bg    = self._bg
+
+        def _enter(_):
+            self.config(bg=_hover)
+            badge.config(bg=color)
+            title_lbl.config(bg=_hover)
+        def _leave(_):
+            self.config(bg=_bg)
+            title_lbl.config(bg=_bg)
+        def _click(_):
+            if on_select:
+                on_select(finding)
+
+        for w in [self, badge, title_lbl]:
+            w.bind("<Enter>", _enter)
+            w.bind("<Leave>", _leave)
+            w.bind("<Button-1>", _click)
 
 
 # ─────────────────────────────────────────────
@@ -406,7 +541,7 @@ class WindowsSecurityAuditorUI:
                                     highlightthickness=0)
         self.bar_canvas.pack(fill="x", pady=(4, 0))
 
-        # module chips — horizontal scrollable canvas (no scrollbar visible)
+        # module chips — clickable toggles + progress indicator
         chips_canvas = tk.Canvas(f, bg=self.t["BG_DEEP"], height=22,
                                  highlightthickness=0)
         chips_canvas.pack(fill="x", pady=(5, 0))
@@ -418,21 +553,52 @@ class WindowsSecurityAuditorUI:
             chips_canvas.configure(scrollregion=chips_canvas.bbox("all"))
         self.step_frame.bind("<Configure>", _chips_configure)
 
-        modules = ["system_info", "users", "password_policy", "network",
-                   "smb_shares", "processes", "signatures",
-                   "tasks", "services", "registry_run", "startup",
-                   "firewall", "windows_update", "uac",
-                   "event_logs", "rdp_config", "suspicious_processes",
-                   "autologin", "bitlocker",
-                   "powershell_logs", "defender"]
+        _all_modules = ["system_info", "users", "password_policy", "network",
+                        "smb_shares", "processes", "signatures",
+                        "tasks", "services", "registry_run", "startup",
+                        "firewall", "windows_update", "uac",
+                        "event_logs", "rdp_config", "suspicious_processes",
+                        "autologin", "bitlocker", "powershell_logs", "defender"]
+
         self._step_labels = {}
-        for m in modules:
+        self._module_vars = {}
+
+        def _chip_on(lbl):
+            lbl.config(fg=self.t["ACCENT"],
+                       highlightbackground=self.t["ACCENT"])
+
+        def _chip_off(lbl):
+            lbl.config(fg=self.t["BORDER"],
+                       highlightbackground=self.t["BORDER"])
+
+        def _make_toggle(mod, lbl, var):
+            def _toggle(_event=None):
+                if self.is_scanning:
+                    return
+                var.set(not var.get())
+                if var.get():
+                    _chip_on(lbl)
+                else:
+                    _chip_off(lbl)
+            lbl.bind("<Button-1>", _toggle)
+            lbl.config(cursor="hand2")
+
+        for m in _all_modules:
+            is_core = m == "system_info"
+            var = tk.BooleanVar(value=True)
+            self._module_vars[m] = var
+
             lbl = tk.Label(self.step_frame, text=m.replace("_", " "),
-                           bg=self.t["BG_DEEP"], fg=self.t["TEXT_SEC"],
+                           bg=self.t["BG_DEEP"],
+                           fg=(self.t["TEXT_SEC"] if is_core else self.t["ACCENT"]),
                            font=("Consolas", 7), padx=4, pady=1,
-                           highlightbackground=self.t["BORDER"], highlightthickness=1)
+                           highlightbackground=(self.t["BORDER"] if is_core else self.t["ACCENT"]),
+                           highlightthickness=1)
             lbl.pack(side="left", padx=2)
             self._step_labels[m] = lbl
+
+            if not is_core:
+                _make_toggle(m, lbl, var)
 
     def _draw_bar(self, pct):
         self.bar_canvas.update_idletasks()
@@ -524,10 +690,36 @@ class WindowsSecurityAuditorUI:
                    lambda e: c.yview_scroll(-1 * (e.delta // 120), "units"))
         return outer, inner
 
+    def _make_scrollable_pair(self, parent):
+        """Returns (outer_frame, inner_frame). Caller is responsible for placing outer."""
+        outer = tk.Frame(parent, bg=self.t["BG_PANEL"],
+                         highlightbackground=self.t["BORDER"], highlightthickness=1)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        c = tk.Canvas(outer, bg=self.t["BG_PANEL"], highlightthickness=0)
+        c.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(outer, orient="vertical", command=c.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        c.configure(yscrollcommand=sb.set)
+
+        inner = tk.Frame(c, bg=self.t["BG_PANEL"])
+        win = c.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: c.configure(scrollregion=c.bbox("all")))
+        c.bind("<Configure>", lambda e: c.itemconfig(win, width=e.width))
+
+        # Scoped wheel: bind only while cursor is inside this canvas
+        c.bind("<Enter>", lambda e: c.bind_all(
+            "<MouseWheel>", lambda ev: c.yview_scroll(-1 * (ev.delta // 120), "units")))
+        c.bind("<Leave>", lambda e: c.unbind_all("<MouseWheel>"))
+
+        return outer, inner
+
     # ── FINDINGS PANEL ──
     def _build_findings_panel(self, parent):
         f = tk.Frame(parent, bg=self.t["BG_DEEP"])
 
+        # Header row
         header = tk.Frame(f, bg=self.t["BG_DEEP"])
         header.pack(fill="x", pady=(0, 4))
         tk.Label(header, text="HALLAZGOS DE SEGURIDAD", bg=self.t["BG_DEEP"],
@@ -536,13 +728,27 @@ class WindowsSecurityAuditorUI:
                                   fg=self.t["TEXT_SEC"], font=("Consolas", 9))
         self.count_lbl.pack(side="right")
 
-        # Executive summary + alerts (se rellena tras escaneo)
+        # Compact status banner
         self.summary_frame = tk.Frame(f, bg=self.t["BG_DEEP"])
         self.summary_frame.pack(fill="x", pady=(0, 4))
 
-        _, self.findings_frame = self._scrollable(f)
+        # Split body: left compact list (weight 3) | right detail pane (weight 2)
+        body = tk.Frame(f, bg=self.t["BG_DEEP"])
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2)
+        body.rowconfigure(0, weight=1)
+
+        list_outer, self.findings_frame = self._make_scrollable_pair(body)
+        list_outer.grid(row=0, column=0, sticky="nsew")
+
+        self._detail_pane = tk.Frame(body, bg=self.t["BG_PANEL"],
+                                     highlightbackground=self.t["BORDER"],
+                                     highlightthickness=1)
+        self._detail_pane.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
         self._show_empty()
+        self._show_detail_placeholder()
         return f
 
     def _render_summary_banner(self, findings, score, comparison=None):
@@ -553,110 +759,241 @@ class WindowsSecurityAuditorUI:
                   for s in ("critical", "high", "medium", "low")}
 
         if counts["critical"] > 0:
-            s_txt, s_col, s_bg, s_ico = "ESTADO CRÍTICO",  "#ff3b5c", "#2a0a10", "⛔"
+            s_txt, s_col, s_bg, s_ico = "ESTADO CRÍTICO", "#ff3b5c", "#2a0a10", "⛔"
         elif counts["high"] > 0:
-            s_txt, s_col, s_bg, s_ico = "EN RIESGO",       "#ff6b35", "#2a1508", "⚠"
+            s_txt, s_col, s_bg, s_ico = "EN RIESGO",      "#ff6b35", "#2a1508", "⚠"
         elif counts["medium"] > 0:
-            s_txt, s_col, s_bg, s_ico = "PRECAUCIÓN",      "#fbbf24", "#2a2008", "⚡"
+            s_txt, s_col, s_bg, s_ico = "PRECAUCIÓN",     "#fbbf24", "#2a2008", "⚡"
         else:
-            s_txt, s_col, s_bg, s_ico = "BAJO RIESGO",     "#10d48e", "#08251a", "✓"
+            s_txt, s_col, s_bg, s_ico = "BAJO RIESGO",    "#10d48e", "#08251a", "✓"
 
+        # ─── STATUS BANNER (collapsible) ───
         banner = tk.Frame(self.summary_frame, bg=s_bg,
                           highlightbackground=s_col, highlightthickness=1)
         banner.pack(fill="x")
 
-        # Fila superior: status + score
-        top = tk.Frame(banner, bg=s_bg)
-        top.pack(fill="x", padx=12, pady=(9, 5))
-        tk.Label(top, text=f"{s_ico}  {s_txt}",
-                 bg=s_bg, fg=s_col, font=("Consolas", 10, "bold")).pack(side="left")
-        tk.Label(top, text=f"Score: {score}/100  |  "
-                           f"Críticos: {counts['critical']}  "
-                           f"Altos: {counts['high']}  "
-                           f"Medios: {counts['medium']}",
-                 bg=s_bg, fg=s_col, font=("Consolas", 8)).pack(side="right")
+        _st_exp     = [False]
+        _st_targets = []
 
-        # Separador
-        tk.Frame(banner, bg=s_col, height=1).pack(fill="x", padx=12)
+        st_hdr = tk.Frame(banner, bg=s_bg, cursor="hand2")
+        st_hdr.pack(fill="x", padx=10, pady=5)
+        _st_targets.append(st_hdr)
 
-        # Alertas: top 6 críticos + altos
-        alerts = [f for f in findings if f["severity"] in ("critical", "high")][:6]
+        lbl_status = tk.Label(st_hdr, text=f"{s_ico}  {s_txt}", bg=s_bg, fg=s_col,
+                              font=("Consolas", 9, "bold"), cursor="hand2")
+        lbl_status.pack(side="left")
+        _st_targets.append(lbl_status)
+
+        pills_fr = tk.Frame(st_hdr, bg=s_bg, cursor="hand2")
+        pills_fr.pack(side="left", padx=14)
+        _st_targets.append(pills_fr)
+        for pill_lbl, cnt, col in [("C", counts["critical"], "#ff3b5c"),
+                                   ("H", counts["high"],     "#ff6b35"),
+                                   ("M", counts["medium"],   "#fbbf24"),
+                                   ("L", counts["low"],      "#10d48e")]:
+            if cnt > 0:
+                pl = tk.Label(pills_fr, text=f"{pill_lbl}:{cnt}", bg=col, fg="#000",
+                              font=("Consolas", 8, "bold"), padx=5, pady=1, cursor="hand2")
+                pl.pack(side="left", padx=2)
+                _st_targets.append(pl)
+
+        st_arrow = tk.Label(st_hdr, text="▶", bg=s_bg, fg=s_col,
+                            font=("Consolas", 8, "bold"), cursor="hand2")
+        st_arrow.pack(side="right", padx=(0, 4))
+        _st_targets.append(st_arrow)
+
+        lbl_score = tk.Label(st_hdr, text=f"Score: {score}/100", bg=s_bg, fg=s_col,
+                             font=("Consolas", 8), cursor="hand2")
+        lbl_score.pack(side="right", padx=(0, 8))
+        _st_targets.append(lbl_score)
+
+        # Detail: all critical + high findings (hidden initially)
+        st_detail = tk.Frame(banner, bg=s_bg)
+        alerts = [f for f in findings if f["severity"] in ("critical", "high")]
         if alerts:
-            af = tk.Frame(banner, bg=s_bg)
-            af.pack(fill="x", padx=12, pady=(5, 9))
+            tk.Frame(st_detail, bg=s_col, height=1).pack(fill="x", padx=12, pady=(0, 4))
             for a in alerts:
-                col = "#ff3b5c" if a["severity"] == "critical" else "#ff6b35"
-                row = tk.Frame(af, bg=s_bg)
-                row.pack(fill="x", pady=1)
-                tk.Label(row, text=f"[{a['severity'].upper()}]",
-                         bg=s_bg, fg=col, font=("Consolas", 8, "bold"),
-                         width=11, anchor="w").pack(side="left")
-                tk.Label(row, text=a["title"][:95],
-                         bg=s_bg, fg="#e8f4ff",
+                a_col = "#ff3b5c" if a["severity"] == "critical" else "#ff6b35"
+                arow  = tk.Frame(st_detail, bg=s_bg)
+                arow.pack(fill="x", padx=12, pady=1)
+                tk.Label(arow, text=f"[{a['severity'].upper()}]", bg=s_bg, fg=a_col,
+                         font=("Consolas", 8, "bold"), width=11, anchor="w").pack(side="left")
+                tk.Label(arow, text=a["title"][:90], bg=s_bg, fg="#e8f4ff",
                          font=("Consolas", 8), anchor="w").pack(side="left")
+            tk.Frame(st_detail, bg=s_bg, height=6).pack()
 
-        # ── Sección de cambios vs escaneo anterior ──
+        def _toggle_status(_=None):
+            if _st_exp[0]:
+                st_detail.pack_forget()
+                st_arrow.config(text="▶")
+                _st_exp[0] = False
+            else:
+                st_detail.pack(fill="x")
+                st_arrow.config(text="▼")
+                _st_exp[0] = True
+
+        for w in _st_targets:
+            w.bind("<Button-1>", _toggle_status)
+
+        # ─── SECURITY EVOLUTION (collapsible) ───
         if comparison:
-            new_f       = comparison.get("new",          [])
-            res_f       = comparison.get("resolved",     [])
-            wors        = comparison.get("worsened",     [])
-            impr        = comparison.get("improved",     [])
             trend       = comparison.get("trend",        "stable")
-            narrative   = comparison.get("narrative",    "")
             score_delta = comparison.get("score_delta")
             prev_score  = comparison.get("prev_score")
             curr_score  = comparison.get("curr_score")
+            new_f       = comparison.get("new",      [])
+            res_f       = comparison.get("resolved", [])
+            wors        = comparison.get("worsened", [])
+            impr        = comparison.get("improved", [])
+            narrative   = comparison.get("narrative", "")
 
             trend_col  = {"improved": "#10d48e", "worsened": "#ff3b5c", "stable": "#6a90b8"}[trend]
             trend_icon = {"improved": "▼ MEJORÓ", "worsened": "▲ EMPEORÓ", "stable": "— ESTABLE"}[trend]
 
-            cb = tk.Frame(self.summary_frame, bg=self.t["BG_PANEL"],
-                          highlightbackground=trend_col, highlightthickness=1)
-            cb.pack(fill="x", pady=(4, 0))
+            _t = self.t
+            evo = tk.Frame(self.summary_frame, bg=_t["BG_PANEL"],
+                           highlightbackground=trend_col, highlightthickness=1)
+            evo.pack(fill="x", pady=(2, 0))
 
-            # Cabecera: Security Evolution
-            hrow = tk.Frame(cb, bg=self.t["BG_PANEL"])
-            hrow.pack(fill="x", padx=12, pady=(8, 4))
-            tk.Label(hrow, text="SECURITY EVOLUTION",
-                     bg=self.t["BG_PANEL"], fg=self.t["TEXT_SEC"],
-                     font=("Consolas", 8, "bold")).pack(side="left")
-            tk.Label(hrow, text=trend_icon,
-                     bg=self.t["BG_PANEL"], fg=trend_col,
-                     font=("Consolas", 8, "bold")).pack(side="right")
+            _evo_exp     = [False]
+            _evo_targets = []
 
-            # Score delta
+            evo_hdr = tk.Frame(evo, bg=_t["BG_PANEL"], cursor="hand2")
+            evo_hdr.pack(fill="x", padx=10, pady=4)
+            _evo_targets.append(evo_hdr)
+
+            lbl_evo = tk.Label(evo_hdr, text="SECURITY EVOLUTION", bg=_t["BG_PANEL"],
+                               fg=_t["TEXT_SEC"], font=("Consolas", 7, "bold"), cursor="hand2")
+            lbl_evo.pack(side="left")
+            _evo_targets.append(lbl_evo)
+
+            lbl_trend = tk.Label(evo_hdr, text=f"  {trend_icon}", bg=_t["BG_PANEL"],
+                                 fg=trend_col, font=("Consolas", 8, "bold"), cursor="hand2")
+            lbl_trend.pack(side="left")
+            _evo_targets.append(lbl_trend)
+
             if prev_score is not None and curr_score is not None:
-                srow = tk.Frame(cb, bg=self.t["BG_PANEL"])
-                srow.pack(fill="x", padx=12, pady=(0, 4))
                 delta_txt = f"+{score_delta}" if score_delta > 0 else str(score_delta)
-                delta_col = "#ff3b5c" if score_delta > 0 else ("#10d48e" if score_delta < 0 else "#6a90b8")
-                tk.Label(srow, text=f"Score: {prev_score} → {curr_score}  ({delta_txt})",
-                         bg=self.t["BG_PANEL"], fg=delta_col,
-                         font=("Consolas", 8)).pack(side="left")
+                delta_col = ("#ff3b5c" if score_delta > 0
+                             else ("#10d48e" if score_delta < 0 else "#6a90b8"))
+                lbl_delta = tk.Label(evo_hdr, text=f"  {prev_score}→{curr_score} ({delta_txt})",
+                                     bg=_t["BG_PANEL"], fg=delta_col,
+                                     font=("Consolas", 8), cursor="hand2")
+                lbl_delta.pack(side="left")
+                _evo_targets.append(lbl_delta)
 
-            # Narrativa
+            evo_arrow = tk.Label(evo_hdr, text="▶", bg=_t["BG_PANEL"],
+                                 fg=trend_col, font=("Consolas", 8), cursor="hand2")
+            evo_arrow.pack(side="right")
+            _evo_targets.append(evo_arrow)
+
+            for e_lbl, e_val, e_col in [(f"▲{len(new_f)}nv", new_f, "#ff6b35"),
+                                        (f"✓{len(res_f)}rs",  res_f, "#10d48e"),
+                                        (f"▲{len(wors)}em",   wors,  "#ff3b5c"),
+                                        (f"▼{len(impr)}mj",   impr,  "#60a5fa")]:
+                if e_val:
+                    el = tk.Label(evo_hdr, text=e_lbl, bg=_t["BG_PANEL"], fg=e_col,
+                                  font=("Consolas", 7), padx=4, cursor="hand2")
+                    el.pack(side="left", padx=(6, 0))
+                    _evo_targets.append(el)
+
+            # Detail section (hidden initially)
+            evo_detail = tk.Frame(evo, bg=_t["BG_PANEL"])
             if narrative:
-                tk.Label(cb, text=narrative[:120], bg=self.t["BG_PANEL"], fg="#a0b8d0",
-                         font=("Consolas", 7), wraplength=600, justify="left").pack(
-                             anchor="w", padx=12, pady=(0, 6))
-
-            # Cambios detallados
-            cf = tk.Frame(cb, bg=self.t["BG_PANEL"])
+                tk.Label(evo_detail, text=narrative[:200], bg=_t["BG_PANEL"], fg="#a0b8d0",
+                         font=("Consolas", 7), wraplength=700, justify="left").pack(
+                             anchor="w", padx=12, pady=(4, 4))
+            cf = tk.Frame(evo_detail, bg=_t["BG_PANEL"])
             cf.pack(fill="x", padx=12, pady=(0, 8))
-
-            for label, items, col in [
-                (f"▲ Nuevos ({len(new_f)})",     new_f[:4],  "#ff6b35"),
-                (f"✓ Resueltos ({len(res_f)})",  res_f[:4],  "#10d48e"),
-                (f"▲ Empeorados ({len(wors)})",  [e["current"] for e in wors[:3]], "#ff3b5c"),
-                (f"▼ Mejorados ({len(impr)})",   [e["current"] for e in impr[:3]], "#60a5fa"),
+            for d_label, d_items, d_col in [
+                (f"▲ Nuevos ({len(new_f)})",    new_f[:6],                           "#ff6b35"),
+                (f"✓ Resueltos ({len(res_f)})", res_f[:6],                           "#10d48e"),
+                (f"▲ Empeorados ({len(wors)})", [e["current"] for e in wors[:4]],    "#ff3b5c"),
+                (f"▼ Mejorados ({len(impr)})",  [e["current"] for e in impr[:4]],    "#60a5fa"),
             ]:
-                if items:
-                    tk.Label(cf, text=label, bg=self.t["BG_PANEL"], fg=col,
-                             font=("Consolas", 8, "bold")).pack(anchor="w", pady=(3, 1))
-                    for f in items:
-                        tk.Label(cf, text=f"  [{f['severity'].upper()}] {f['title'][:80]}",
-                                 bg=self.t["BG_PANEL"], fg="#a0b8d0",
+                if d_items:
+                    tk.Label(cf, text=d_label, bg=_t["BG_PANEL"], fg=d_col,
+                             font=("Consolas", 8, "bold")).pack(anchor="w", pady=(4, 1))
+                    for item in d_items:
+                        tk.Label(cf, text=f"  [{item['severity'].upper()}] {item['title'][:80]}",
+                                 bg=_t["BG_PANEL"], fg="#a0b8d0",
                                  font=("Consolas", 7)).pack(anchor="w")
+
+            def _toggle_evo(_=None):
+                if _evo_exp[0]:
+                    evo_detail.pack_forget()
+                    evo_arrow.config(text="▶")
+                    _evo_exp[0] = False
+                else:
+                    evo_detail.pack(fill="x")
+                    evo_arrow.config(text="▼")
+                    _evo_exp[0] = True
+
+            for w in _evo_targets:
+                w.bind("<Button-1>", _toggle_evo)
+
+    # ── DETAIL PANE ──
+    def _show_detail_placeholder(self):
+        for w in self._detail_pane.winfo_children():
+            w.destroy()
+        tk.Label(self._detail_pane,
+                 text="\n\n↑\n\nSelecciona un hallazgo\npara ver su detalle",
+                 bg=self.t["BG_PANEL"], fg=self.t["TEXT_SEC"],
+                 font=("Consolas", 9), justify="center").pack(expand=True)
+
+    def _select_finding(self, finding):
+        t = self.t
+        dp = self._detail_pane
+        for w in dp.winfo_children():
+            w.destroy()
+
+        sev   = finding["severity"]
+        color = SEV_COLORS.get(sev, t["TEXT_SEC"])
+
+        # Colored top stripe
+        tk.Frame(dp, bg=color, height=3).pack(fill="x")
+
+        # Header: severity badge + title
+        hdr = tk.Frame(dp, bg=t["BG_CARD"])
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=f" {sev.upper()} ", bg=color, fg="#000",
+                 font=("Consolas", 8, "bold"), padx=4).pack(
+                     side="left", padx=(8, 6), pady=8)
+        tk.Label(hdr, text=finding["title"], bg=t["BG_CARD"], fg=t["TEXT_PRI"],
+                 font=("Consolas", 9, "bold"), wraplength=360, justify="left",
+                 anchor="w").pack(side="left", fill="x", expand=True, pady=8, padx=(0, 8))
+
+        # MITRE tags
+        if finding.get("mitre"):
+            mr = tk.Frame(dp, bg=t["BG_PANEL"])
+            mr.pack(fill="x", padx=8, pady=(4, 0))
+            for tag in finding["mitre"][:3]:
+                short = tag.split(" - ")[0]
+                tk.Label(mr, text=short, bg=t["BG_HOVER"], fg=t["ACCENT"],
+                         font=("Consolas", 7), padx=5, pady=2).pack(side="left", padx=(0, 4))
+
+        tk.Frame(dp, bg=t["BORDER"], height=1).pack(fill="x", padx=8, pady=(8, 0))
+
+        # Scrollable content sections
+        content_outer, content_inner = self._make_scrollable_pair(dp)
+        content_outer.pack(fill="both", expand=True)
+
+        def _sec(title, body, col):
+            if not body:
+                return
+            sec = tk.Frame(content_inner, bg=t["BG_PANEL"])
+            sec.pack(fill="x", padx=10, pady=(10, 2))
+            tk.Label(sec, text=title, bg=t["BG_PANEL"], fg=col,
+                     font=("Consolas", 8, "bold")).pack(anchor="w")
+            tk.Label(sec, text=body, bg=t["BG_PANEL"], fg=t["TEXT_PRI"],
+                     font=("Consolas", 8), wraplength=360, justify="left",
+                     anchor="w").pack(anchor="w", padx=8, pady=(3, 0))
+
+        _sec("¿QUÉ ES?",         finding.get("explanation", ""),    t["ACCENT"])
+        _sec("IMPACTO",          finding.get("impact", ""),          "#ff6b35")
+        _sec("RECOMENDACIÓN",    finding.get("recommendation", ""), "#10d48e")
+        if finding.get("details"):
+            _sec("DETALLE TÉCNICO", finding["details"],             t["TEXT_SEC"])
 
     # ── HISTORY PANEL ──
     def _build_history_panel(self, parent):
@@ -708,7 +1045,9 @@ class WindowsSecurityAuditorUI:
         threading.Thread(target=self._run_scan, daemon=True).start()
 
     def _run_scan(self):
-        results = self.scanner.collect_all(progress_callback=self._on_progress)
+        enabled = {mod for mod, var in self._module_vars.items() if var.get()}
+        results = self.scanner.collect_all(progress_callback=self._on_progress,
+                                           enabled_modules=enabled)
         findings, score = self.analyzer.analyze(results)
 
         self.findings_all = findings
@@ -781,6 +1120,7 @@ class WindowsSecurityAuditorUI:
     # ─── RENDER FINDINGS ───
     def _render_findings(self, findings):
         self._clear_findings_ui()
+        self._show_detail_placeholder()
         if not findings:
             self._show_empty(ok=True)
             self.count_lbl.config(text="0 hallazgos")
@@ -788,7 +1128,8 @@ class WindowsSecurityAuditorUI:
 
         self.count_lbl.config(text=f"{len(findings)} hallazgo(s)")
         for i, f in enumerate(findings):
-            FindingRow(self.findings_frame, f, i, self.t)
+            CompactFindingRow(self.findings_frame, f, i, self.t,
+                              on_select=self._select_finding)
 
     def _apply_filter(self):
         sev = self.filter_sev.get()
@@ -1136,10 +1477,14 @@ class WindowsSecurityAuditorUI:
 
     # ─── CLEAR ALL ───
     def clear_all(self):
-        self.findings_all = []
-        self.last_score   = 0
+        self.findings_all    = []
+        self.last_score      = 0
+        self.last_comparison = None
         self._clear_findings_ui()
         self._show_empty()
+        self._show_detail_placeholder()
+        for w in self.summary_frame.winfo_children():
+            w.destroy()
         self.card_score.update("—", self.t["RED"])
         self.card_critical.update("0", "#ff3b5c")
         self.card_high.update("0", "#ff6b35")

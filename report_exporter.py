@@ -387,7 +387,7 @@ def export_html(findings, score, system_info=None, output_path=None, comparison=
                    else "#fbbf24" if score <= 60
                    else "#ff3b5c")
 
-    # ── finding rows ──
+    # ── finding cards (expandable with <details>) ──
     rows_html = ""
     for f in findings:
         sev   = f["severity"]
@@ -402,15 +402,46 @@ def export_html(findings, score, system_info=None, output_path=None, comparison=
             f'<span style="background:{color};color:#000;padding:2px 8px;'
             f'border-radius:4px;font-size:11px;font-weight:700;">{sev.upper()}</span>'
         )
-        title_style = "color:#9ab8d8;font-style:italic;" if is_review else "color:#e8f4ff;font-weight:600;"
+        title_color = "#9ab8d8" if is_review else "#e8f4ff"
+        title_style = "font-style:italic;" if is_review else "font-weight:600;"
+
+        explanation  = f.get("explanation",  "")
+        impact       = f.get("impact",       "")
+        recommendation = f.get("recommendation", "")
+        details_text = f.get("details", "")
+
+        def _info_block(label, text, col):
+            if not text:
+                return ""
+            return (
+                f'<div style="margin-top:10px;">'
+                f'<div style="font-size:10px;color:{col};letter-spacing:2px;font-weight:700;">{label}</div>'
+                f'<div style="color:#c8d8e8;font-size:12px;line-height:1.6;margin-top:4px;'
+                f'padding-left:8px;border-left:2px solid {col};">{text}</div>'
+                f'</div>'
+            )
+
+        detail_section = (
+            _info_block("¿QUÉ ES?",           explanation,    "#00d4ff") +
+            _info_block("IMPACTO POTENCIAL",   impact,        "#ff6b35") +
+            _info_block("RECOMENDACIÓN",        recommendation,"#10d48e") +
+            (_info_block("DETALLE TÉCNICO",     details_text,  "#6a90b8") if details_text else "")
+        )
+
         rows_html += f"""
-        <tr style="background:{bg}; border-bottom:1px solid #1a3a5c;">
-          <td style="padding:10px 14px;">{badge}</td>
-          <td style="padding:10px 14px;{title_style}">{f['title']}</td>
-          <td style="padding:10px 14px;color:#6a90b8;font-size:12px;word-break:break-all;">{f['details']}</td>
-          <td style="padding:10px 14px;color:#10d48e;font-size:12px;">{f['recommendation']}</td>
-          <td style="padding:10px 14px;color:#00d4ff;font-size:11px;">{mitre}</td>
-        </tr>"""
+        <details style="background:{bg};border-left:3px solid {color};border-radius:6px;
+                        margin:6px 0;overflow:hidden;">
+          <summary style="padding:12px 16px;cursor:pointer;display:flex;align-items:center;
+                          gap:12px;list-style:none;outline:none;">
+            {badge}
+            <span style="color:{title_color};{title_style}font-size:13px;flex:1;">{f['title']}</span>
+            <span style="color:#6a90b8;font-size:11px;">{mitre}</span>
+            <span style="color:#6a90b8;font-size:18px;margin-left:8px;">&#8250;</span>
+          </summary>
+          <div style="padding:4px 20px 16px 20px;border-top:1px solid #1a3a5c;">
+            {detail_section}
+          </div>
+        </details>"""
 
     html = f"""<!DOCTYPE html>
 <html lang="es">
@@ -547,28 +578,15 @@ def export_html(findings, score, system_info=None, output_path=None, comparison=
   <div class="sysinfo-item"><div class="k">FECHA DE ESCANEO</div><div class="v">{system_info.get('scan_time', now)}</div></div>
 </div>"""] if system_info else [])}
 
-<!-- FINDINGS TABLE -->
+<!-- FINDINGS -->
 <div class="section">
-  <div class="section-title">Hallazgos de seguridad ({len(findings)})</div>
-  <table>
-    <thead>
-      <tr>
-        <th>SEVERIDAD</th>
-        <th>HALLAZGO</th>
-        <th>DETALLE</th>
-        <th>RECOMENDACIÓN</th>
-        <th>MITRE ATT&CK</th>
-      </tr>
-    </thead>
-    <tbody>
-      {rows_html if rows_html else '<tr><td colspan="5" style="text-align:center;padding:30px;color:#6a90b8;">✅ Sin hallazgos detectados</td></tr>'}
-    </tbody>
-  </table>
+  <div class="section-title">Hallazgos de seguridad ({len(findings)}) — haz clic para expandir</div>
+  {rows_html if rows_html else '<div style="text-align:center;padding:30px;color:#6a90b8;">✅ Sin hallazgos detectados</div>'}
 </div>
 
 <!-- FOOTER -->
 <div class="footer">
-  Windows Vuln Scanner v2.0 PRO &nbsp;•&nbsp; SOC Edition &nbsp;•&nbsp;
+  Windows Vuln Scanner v1.0 &nbsp;•&nbsp; SOC Edition &nbsp;•&nbsp;
   Uso exclusivo en entornos autorizados &nbsp;•&nbsp; {now}
 </div>
 
@@ -582,7 +600,7 @@ def export_html(findings, score, system_info=None, output_path=None, comparison=
 
 def export_json(findings, score, system_info=None, output_path=None):
     report = {
-        "tool":           "Windows Vuln Scanner v2.0 PRO",
+        "tool":           "Windows Vuln Scanner v1.0",
         "generated":      datetime.now().isoformat(),
         "system":         system_info or {},
         "score":          score,
@@ -606,7 +624,7 @@ def export_txt(findings, score, system_info=None, output_path=None):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
         "=" * 70,
-        "  WINDOWS VULN SCANNER v2.0 PRO — REPORTE DE SEGURIDAD",
+        "  WINDOWS VULN SCANNER v1.0 — REPORTE DE SEGURIDAD",
         "=" * 70,
         f"  Fecha    : {now}",
         f"  Host     : {(system_info or {}).get('hostname', '—')}",

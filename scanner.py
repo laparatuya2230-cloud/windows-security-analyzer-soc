@@ -22,6 +22,11 @@ class WindowsScanner:
     def __init__(self, logger):
         self.logger = logger
         self.encoding = locale.getpreferredencoding(False) or "cp850"
+        import os
+        _exe = os.path.abspath(sys.executable)
+        self._own_exe  = _exe.replace("'", "''")
+        self._own_name = os.path.splitext(os.path.basename(_exe))[0]
+        self._own_dir  = os.path.dirname(os.path.dirname(_exe))
 
     def run_command(self, args):
         try:
@@ -236,24 +241,24 @@ class WindowsScanner:
     # 🔏 DIGITAL SIGNATURES
     # =========================
     def collect_signatures(self):
-        import csv, io, os, sys
-
-        # Nombre del propio ejecutable para excluirlo (evita que la app se detecte a sí misma)
-        own_name = os.path.splitext(os.path.basename(sys.executable))[0]
+        import csv, io
+        own_exe, own_name, own_dir = self._own_exe, self._own_name, self._own_dir
 
         ps = (
             "Get-Process | Where-Object { "
             "  $_.Path -and "
-            "  $_.Path -notlike '*\\WindowsApps\\*' -and "      # Store apps: catalog signing
+            "  $_.Path -notlike '*\\WindowsApps\\*' -and "
             "  $_.Path -notlike '*\\Windows\\System32\\*' -and "
             "  $_.Path -notlike '*\\Windows\\SysWOW64\\*' -and "
-            "  $_.Path -notlike '*\\Program Files\\*' -and "     # Software comercial instalado
+            "  $_.Path -notlike '*\\Program Files\\*' -and "
             "  $_.Path -notlike '*\\Program Files (x86)\\*' -and "
             "  $_.Path -notlike '*\\Riot Games\\*' -and "
             "  $_.Path -notlike '*\\Steam\\*' -and "
             "  $_.Path -notlike '*\\Epic Games\\*' -and "
             "  $_.Path -notlike '*.venv\\*' -and "
             "  $_.Path -notlike '*\\Python*\\Scripts\\*' -and "
+            f"  $_.Path -ne '{own_exe}' -and "
+            f"  $_.Path -notlike '{own_dir}\\*' -and "
             f"  $_.Name -ne '{own_name}' "
             "} | ForEach-Object { "
             "  $sig = Get-AuthenticodeSignature $_.Path -ErrorAction SilentlyContinue; "
@@ -572,11 +577,16 @@ class WindowsScanner:
     # =========================
     def collect_suspicious_processes(self):
         import csv, io, os, sys
+        own_exe  = os.path.abspath(sys.executable).replace("'", "''")
         own_name = os.path.splitext(os.path.basename(sys.executable))[0]
+        own_dir  = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
         ps = (
-            "Get-Process | Where-Object { "
+            # Step 1: filter by suspicious paths, excluding own process and dev environment
+            "$procs = Get-Process | Where-Object { "
             "  $_.Path -and "
+            f"  $_.Path -ne '{own_exe}' -and "
             f"  $_.Name -ne '{own_name}' -and "
+            f"  $_.Path -notlike '{own_dir}\\*' -and "
             "  $_.Path -notlike '*.venv\\*' -and "
             "  $_.Path -notlike '*\\Python*\\Scripts\\*' -and "
             "  ("
@@ -586,7 +596,19 @@ class WindowsScanner:
             "    $_.Path -like '*\\Desktop\\*' -or "
             "    $_.Path -like '*\\Public\\*' "
             "  ) "
-            "} | Select Name,Path,Id | ConvertTo-Csv -NoTypeInformation"
+            # Deduplicate by executable path (multiple instances of same exe = one finding)
+            "} | Sort-Object Path -Unique; "
+            # Step 2: only report processes that are explicitly unsigned or tampered.
+            # 'Valid' → trusted embedded sig. 'UnknownError' → catalog-signed (also trusted).
+            # Only 'NotSigned' or 'HashMismatch' are genuinely suspicious.
+            "$result = $procs | ForEach-Object { "
+            "  $sig = Get-AuthenticodeSignature $_.Path -EA SilentlyContinue; "
+            "  $status = if ($sig) { $sig.Status.ToString() } else { 'NotSigned' }; "
+            "  if ($status -eq 'NotSigned' -or $status -eq 'HashMismatch') { "
+            "    [PSCustomObject]@{Name=$_.Name; Path=$_.Path; Id=$_.Id} "
+            "  } "
+            "}; "
+            "if ($result) { $result | ConvertTo-Csv -NoTypeInformation } else { '\"Name\",\"Path\",\"Id\"' }"
         )
         raw = self.run_powershell(ps)
         procs = []
@@ -762,8 +784,8 @@ class WindowsScanner:
     # =========================
     # 🚀 MASTER
     # =========================
-    def collect_all(self, progress_callback=None):
-        modules = [
+    def collect_all(self, progress_callback=None, enabled_modules=None):
+        all_modules = [
             ("system_info",      self.collect_system_info),
             ("users",            self.collect_users),
             ("password_policy",  self.collect_password_policy),
@@ -786,6 +808,13 @@ class WindowsScanner:
             ("powershell_logs",       self.collect_powershell_logs),
             ("defender",              self.collect_defender),
         ]
+
+        # system_info always runs (needed for UI info panel)
+        if enabled_modules is not None:
+            modules = [(n, f) for n, f in all_modules
+                       if n == "system_info" or n in enabled_modules]
+        else:
+            modules = all_modules
 
         results = {}
         for i, (name, func) in enumerate(modules, 1):
